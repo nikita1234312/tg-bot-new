@@ -12,8 +12,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TOKEN = "8431935487:AAFBSEtd1uU6h2rAf7vwlNKLguZYSNtuIXE"
-DATABASE_URL = "postgresql://postgres:Prokopenko_772@db.kkfckmmbdvohwujpxofc.supabase.co:5432/postgres"
+TOKEN = os.getenv('BOT_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 bot = Bot(token=TOKEN, parse_mode='HTML')
 dp = Dispatcher(bot)
