@@ -54,62 +54,6 @@ bot = Bot(token=TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# ==================== STATES (СОСТОЯНИЯ FSM) ====================
-
-class OrderForm(StatesGroup):
-    step1_name = State()
-    step2_phone = State()
-    step3_date = State()
-    step4_target = State()
-    step5_budget = State()
-    step6_players = State()
-    step7_emotions = State()
-    step8_basis = State()
-    step9_source = State()
-    step10_frequency = State()
-    step11_description = State()
-    step12_telegram = State()
-
-class ProfileEditForm(StatesGroup):
-    edit_name = State()
-    edit_phone = State()
-    edit_email = State()
-    edit_city = State()
-    edit_event_date = State()
-
-class ConsultationForm(StatesGroup):
-    choose_date = State()
-    choose_time = State()
-    payment = State()
-
-class PayoutForm(StatesGroup):
-    enter_amount = State()
-    enter_card = State()
-    enter_card_holder = State()
-
-class AdminStates(StatesGroup):
-    add_consultation_slot_date = State()
-    add_consultation_slot_time = State()
-    add_portfolio_title = State()
-    add_portfolio_description = State()
-    add_portfolio_game_type = State()
-    add_portfolio_client = State()
-    add_portfolio_photos = State()
-    edit_setting_select = State()
-    edit_setting_value = State()
-    create_bonus_name = State()
-    create_bonus_description = State()
-    create_bonus_reward = State()
-    create_bonus_conditions = State()
-    send_mailing_title = State()
-    send_mailing_message = State()
-    send_mailing_audience = State()
-
-class ReceiptForm(StatesGroup):
-    enter_amount = State()
-    enter_type = State()
-    upload_receipt = State()
-
 # ==================== БАЗА ДАННЫХ ====================
 class Database:
     def __init__(self):
@@ -2983,10 +2927,13 @@ async def cmd_start(message: types.Message):
             referrer_code
         )
     
-    welcome_text = """🎯 ВАША ЖИЗНЬ — ВАША ИГРА, КОТОРАЯ СТАНЕТ ЛЕГЕНДОЙ!
+    welcome_text = """🎯 **Ваша жизнь — ваша игра, которая станет легендой!**
 
-• Пока другие дарят обычные подарки, которые забываются через неделю...
-…вы можете создать личную вселенную. Игру, где зашифрованы ваши шутки, ваши ценности, ваши «а помнишь?..». Это машина времени, понятная только вашему кругу. Самый индивидуальный и долговечный подарок — ваша собственная история, в которую можно играть."""
+                Пока другие дарят обычные подарки, которые забываются через неделю, вы создаете личную вселенную. 
+
+                Это игра, где зашифрованы ваши шутки, ценности и те самые «а помнишь?..». Настоящая машина времени, понятная только вашему кругу. 
+
+                ✨ **Самый ценный подарок — это ваша общая история, в которую можно играть снова и снова.**"""
     
     is_admin = await db.is_admin(user['id'])
     await message.answer(welcome_text, reply_markup=get_main_menu_keyboard(is_admin))
@@ -3204,7 +3151,7 @@ async def process_step6_players(callback_query: types.CallbackQuery, state: FSMC
     
     async with state.proxy() as data:
         data['players_count'] = players_map.get(callback_query.data, 'Другое')
-        data['emotions'] = []  # Инициализируем список эмоций
+        data['emotions'] = []  
     
     await OrderForm.next()
     await bot.edit_message_text(
@@ -3215,7 +3162,7 @@ async def process_step6_players(callback_query: types.CallbackQuery, state: FSMC
     )
 
 # Шаг 7 - эмоции (множественный выбор)
-@dp.callback_query_handler(lambda c: c.data.startswith('emotion_'), state=OrderForm.step7_emotions)
+@dp.callback_query_handler(lambda c: c.data.startswith('emotion_') or c.data == 'emotions_next', state=OrderForm.step7_emotions)
 async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSMContext):
     """Шаг 7: Эмоции (множественный выбор)"""
     emotion_map = {
@@ -3261,9 +3208,7 @@ async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSM
             await bot.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=callback_query.message.message_id,
-                text=f"""7/12 ❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)
-
-Выбрано: {selected}""",
+                text=f"""7/12 ❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько) Выбрано: {selected}""",
                 reply_markup=get_emotions_keyboard()
             )
 
