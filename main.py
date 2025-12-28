@@ -5,6 +5,7 @@ import json
 import uuid
 import csv
 import io
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Set
 from enum import Enum
@@ -17,7 +18,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from aiogram.types import InputFile, ContentType, InputMediaPhoto
 from aiogram.utils.exceptions import BotBlocked, ChatNotFound
 from aiogram.utils.markdown import escape_md
@@ -46,9 +47,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS', '0').split(',') if x.strip()]
-DB_URL = os.getenv('DATABASE_URL')
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS").split(",")]
+DB_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
@@ -129,6 +130,7 @@ class Database:
                     id SERIAL PRIMARY KEY,
                     order_number VARCHAR(20) UNIQUE NOT NULL,
                     user_id INTEGER REFERENCES users(id) NOT NULL,
+                    phone VARCHAR(20),
                     game_name VARCHAR(200),
                     occasion TEXT,
                     target_audience VARCHAR(50),
@@ -707,73 +709,49 @@ class Database:
     # ==================== ЗАКАЗЫ ====================
     
     async def create_order(self, user_id: int, data: Dict) -> Dict:
-        """Создать новый заказ"""
+        """Создать новый заказ с исправленным порядком полей"""
         async with self.pool.acquire() as conn:
-            # Генерация номера заказа
+            # 1. Генерация номера
             order_number = f"SG{datetime.now().strftime('%y%m%d')}{uuid.uuid4().hex[:5].upper()}"
             
-            # Создание заказа
+            # 2. Вставка в БД (внутри блока conn)
             order = await conn.fetchrow('''
                 INSERT INTO orders (
-                    order_number, user_id, game_name, occasion, target_audience,
+                    order_number, user_id, phone, game_name, occasion, target_audience,
                     budget, players_count, emotions, game_basis, source,
                     play_frequency, description, telegram_username,
                     started_at, last_activity
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 RETURNING *
-            ''', order_number, user_id, 
-                data.get('game_name'), data.get('occasion'), data.get('target_audience'),
-                data.get('budget'), data.get('players_count'), json.dumps(data.get('emotions', [])),
-                data.get('game_basis'), data.get('source'), data.get('play_frequency'),
-                data.get('description'), data.get('telegram_username')
+            ''', 
+            order_number, user_id, data.get('phone'), data.get('game_name'), 
+            data.get('occasion'), data.get('target_audience'), data.get('budget'),      
+            data.get('players_count'), json.dumps(data.get('emotions', [])), 
+            data.get('game_basis'), data.get('source'), data.get('play_frequency'), 
+            data.get('description'), data.get('telegram_username') 
             )
-            
-            # Создание этапов заказа
-            stages = [
-                (1, 'Анализ требований', 'Изучение требований клиента, согласование идеи и бюджета'),
-                (2, 'Разработка концепции', 'Создание концепции игры, продумывание механики и сюжета'),
-                (3, 'Дизайн игрового поля', 'Разработка дизайна игрового поля и визуального стиля'),
-                (4, 'Создание прототипа', 'Создание физического прототипа для тестирования'),
-                (5, 'Балансировка игрового процесса', 'Тестирование и балансировка игровых механик'),
-                (6, 'Дизайн компонентов', 'Дизайн карточек, фигурок, инструкции и упаковки'),
-                (7, 'Тестирование', 'Тестирование игры с фокус-группой, сбор отзывов'),
-                (8, 'Финальные правки', 'Внесение финальных правок по результатам тестирования'),
-                (9, 'Подготовка к отправке', 'Подготовка финальной версии, упаковка и логистика')
-            ]
-            
-            for stage_num, stage_name, stage_desc in stages:
-                await conn.execute('''
-                    INSERT INTO order_stages (order_id, stage_number, stage_name, description)
-                    VALUES ($1, $2, $3, $4)
-                ''', order['id'], stage_num, stage_name, stage_desc)
-            
-            # Обновление счетчика заказов пользователя
-            await conn.execute('''
-                UPDATE users SET total_orders = total_orders + 1 WHERE id = $1
-            ''', user_id)
-            
-            # Уведомление админам
-            user = await self.get_user_by_id(user_id)
-            await self.create_notification(
-                'new_order',
-                None,  # Для всех админов
-                {
-                    'order_id': order['id'],
-                    'order_number': order_number,
-                    'user_id': user_id,
-                    'user_name': user['full_name'],
-                    'user_phone': user.get('phone'),
-                    'user_telegram': user.get('username'),
-                    'game_name': data.get('game_name'),
-                    'budget': data.get('budget')
-                },
-                admin_only=True
-            )
-            
-            # Логирование
-            await self.log_activity(user_id, 'order_created', {'order_id': order['id'], 'order_number': order_number})
-            
-            return dict(order)
+
+        user = await self.get_user_by_id(user_id) 
+
+        user_name = user['full_name'] if user else "Неизвестный"
+
+        await self.create_notification(
+            'new_order',
+            None,
+            {
+                'order_id': order['id'],
+                'order_number': order_number,
+                'user_id': user_id,
+                'user_name': user_name, 
+                'user_phone': data.get('phone'), 
+                'user_telegram': data.get('telegram_username'),
+                'game_name': data.get('game_name'),
+                'budget': data.get('budget')
+            },
+            admin_only=True
+        )
+        
+        return dict(order)
     
     async def get_user_orders(self, user_id: int, limit: int = 10) -> List[Dict]:
         """Получить заказы пользователя"""
@@ -2663,11 +2641,12 @@ def get_back_to_help_keyboard() -> InlineKeyboardMarkup:
     keyboard.add(InlineKeyboardButton("🔙 Назад в помощь", callback_data="back_to_help"))
     return keyboard
 
-def get_back_to_menu_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка назад в меню"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
+def get_back_to_menu_keyboard() -> ReplyKeyboardMarkup: # Меняем тип
+    """Кнопка назад в меню (внизу экрана)"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True) # Меняем класс
+    keyboard.add(KeyboardButton("🔙 Главное меню")) # Используем KeyboardButton
     return keyboard
+
 
 def get_order_start_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура начала оформления заказа"""
@@ -3015,15 +2994,32 @@ async def order_start(message: types.Message):
     
     await message.answer(order_text, reply_markup=get_order_start_keyboard())
 
-@dp.message_handler(lambda message: message.text == "🚀 Начать оформление")
-async def start_order_creation(message: types.Message):
-    """Обработчик кнопки Начать оформление"""
-    await OrderForm.step1_name.set()
-    await message.answer("""Начинаем создание вашей игры!
 
-Шаг 1/12:
-👤 Как вас зовут?
-Укажите имя для обращения в работе.""", reply_markup=get_cancel_keyboard())
+@dp.message_handler(lambda message: message.text == "🔙 Главное меню", state='*')
+async def process_main_menu_text(message: types.Message, state: FSMContext):
+    await state.finish()
+    user = await db.get_user(message.from_user.id)
+    is_admin = await db.is_admin(user['id']) if user else False
+    await message.answer("📌 ГЛАВНОЕ МЕНЮ:", reply_markup=get_main_menu_keyboard(is_admin))
+
+
+@dp.message_handler(lambda message: message.text == "🚀 Начать оформление", state='*')
+async def start_order_creation(message: types.Message, state: FSMContext):
+    """Обработчик кнопки Начать оформление"""
+    await state.finish() 
+    await OrderForm.step1_name.set()
+    
+    temp_msg = await message.answer("Загрузка анкеты...", reply_markup=ReplyKeyboardRemove())
+    await temp_msg.delete()
+    
+    await message.answer(
+        "<b>Начинаем создание вашей игры!</b>\n\n"
+        "<b>Шаг 1/11:</b>\n"
+        "👤 Как вас зовут?\n"
+        "Укажите имя для обращения в работе",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
 
 @dp.message_handler(lambda message: message.text == "👑 Админ")
 async def admin_panel(message: types.Message):
@@ -3063,39 +3059,90 @@ async def admin_panel(message: types.Message):
 @dp.message_handler(state=OrderForm.step1_name)
 async def process_step1_name(message: types.Message, state: FSMContext):
     """Шаг 1: Имя"""
+    if len(message.text) < 2:
+        return await message.answer("⚠ Пожалуйста, введите корректное имя (хотя бы 2 символа)")
+
     async with state.proxy() as data:
         data['name'] = message.text
         user = await db.get_user(message.from_user.id)
         data['user_id'] = user['id']
     
     await OrderForm.next()
-    await message.answer("""2/12 📞 Ваш контактный телефон для связи?
-В формате +7XXX...""", reply_markup=get_cancel_keyboard())
+    await message.answer(
+        "<b>Шаг 2/11</b>\n\n📞 <b>Ваш контактный телефон для связи?</b>\n"
+        "\nВведите в формате: <code>+7XXXXXXXXXX</code>\n", 
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
 
 @dp.message_handler(state=OrderForm.step2_phone)
 async def process_step2_phone(message: types.Message, state: FSMContext):
-    """Шаг 2: Телефон"""
+    """Шаг 2: Телефон (Универсальная валидация: мобильные + городские)"""
+    raw_phone = "".join(filter(str.isdigit, message.text)) 
+    
+    if len(raw_phone) != 11:
+        return await message.answer(
+            "⚠ <b>Ошибка в длине номера!</b>\n\n"
+            "Номер должен содержать 11 цифр\n"
+            "Пример: <code>+74951234567</code> или <code>+79001234567</code>",
+            parse_mode="HTML", reply_markup=get_cancel_keyboard()
+        )
+
+    if len(set(raw_phone)) <= 3:
+        return await message.answer(
+            "⚠ <b>Похоже на некорректный номер!</b>\n"
+            "Пожалуйста, введите настоящий номер телефона",
+            parse_mode="HTML", reply_markup=get_cancel_keyboard()
+        )
+
+    if raw_phone[1] not in ['3', '4', '8', '9']:
+        return await message.answer(
+            "⚠ <b>Некорректный код номера!</b>\n"
+            "Номер должен начинаться с +7, а далее код на 3, 4, 8 или 9\n"
+            "Пожалуйста, проверьте ввод",
+            parse_mode="HTML", reply_markup=get_cancel_keyboard()
+        )
+
+    formatted_phone = "+7" + raw_phone[1:]
+
     async with state.proxy() as data:
-        data['phone'] = message.text
+        data['phone'] = formatted_phone
     
     await OrderForm.next()
-    await message.answer("""3/12 📅 Для какого события или даты создаётся игра?
-Например: «Юбилей 15.08.2024»""", reply_markup=get_cancel_keyboard())
+    await message.answer(
+        "<b>Шаг 3/11</b>\n\n📅 <b>Для какого события или даты создаётся игра?</b>\n"
+        "\nНапример: «Юбилей 15.08.2024»", 
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
 
 @dp.message_handler(state=OrderForm.step3_date)
 async def process_step3_date(message: types.Message, state: FSMContext):
-    """Шаг 3: Дата события"""
+    """Шаг 3: Дата события (с валидацией)"""
+    text = message.text.strip()
+
+    if len(text) < 5:
+        return await message.answer(
+            "⚠ <b>Слишком короткое описание!</b>\n\n"
+            "Пожалуйста, напишите подробнее, например: <i>«Свадьба 20 сентября»</i> или <i>«Корпоратив в декабре»</i>",
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard()
+        )
+    
     async with state.proxy() as data:
-        data['occasion'] = message.text
+        data['occasion'] = text
     
     await OrderForm.next()
-    await message.answer("""4/12 🎁 Для кого предназначена игра?
-(Выберите или укажите своё)""", reply_markup=get_target_audience_keyboard())
+    await message.answer(
+        "<b>Шаг 4/11</b>\n\n🎁 <b>Для кого предназначена игра?</b>\n"
+        "\n(Выберите вариант или введите свой)", 
+        reply_markup=get_target_audience_keyboard()
+    )
 
 # Шаг 4 - выбор целевой аудитории (inline кнопки)
 @dp.callback_query_handler(lambda c: c.data.startswith('target_'), state=OrderForm.step4_target)
 async def process_step4_target(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 4: Целевая аудитория"""
+    """<b>Шаг 4: Целевая аудитория</b>"""
     target_map = {
         'target_family': 'Для семьи',
         'target_couple': 'Для второй половинки',
@@ -3111,7 +3158,7 @@ async def process_step4_target(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""5/12 💰 Каков ваш ориентировочный бюджет?""",
+        text="""<b>Шаг 5/11 \n\n💰 Каков ваш ориентировочный бюджет?</b>""",
         reply_markup=get_budget_keyboard()
     )
 
@@ -3134,7 +3181,7 @@ async def process_step5_budget(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""6/12 🔢 Сколько игроков будет играть одновременно?""",
+        text="<b>Шаг 6/11 \n\n🔢 Сколько игроков будет играть одновременно?</b>",
         reply_markup=get_players_keyboard()
     )
 
@@ -3157,7 +3204,7 @@ async def process_step6_players(callback_query: types.CallbackQuery, state: FSMC
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""7/12 ❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)""",
+        text="""<b>Шаг 7/11 \n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b>""",
         reply_markup=get_emotions_keyboard()
     )
 
@@ -3178,18 +3225,16 @@ async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSM
         emotions = data.get('emotions', [])
         
         if callback_query.data == 'emotions_next':
-            # Проверяем, что выбрана хотя бы одна эмоция
             if not emotions:
                 await bot.answer_callback_query(callback_query.id, "Пожалуйста, выберите хотя бы одну эмоцию")
                 return
             
-            # Переход к следующему шагу
             await OrderForm.next()
             await bot.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=callback_query.message.message_id,
-                text="""8/12 🎯 На основе какой игры вы хотите создать свою?
-Например: «Монополия», «Алиас», «Крокодил» или своя уникальная механика.""",
+                text="""<b>Шаг 8/11 \n\n🎯 На основе какой игры вы хотите создать свою?</b>
+\nНапример: «Монополия», «Алиас», «Крокодил» или своя уникальная механика.""",
                 reply_markup=get_cancel_keyboard()
             )
             return
@@ -3197,18 +3242,17 @@ async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSM
         emotion = emotion_map.get(callback_query.data)
         if emotion:
             if emotion in emotions:
-                emotions.remove(emotion)  # Снимаем выбор
+                emotions.remove(emotion)
             else:
-                emotions.append(emotion)  # Добавляем выбор
+                emotions.append(emotion)
             
             data['emotions'] = emotions
             
-            # Обновляем сообщение с текущим выбором
             selected = ', '.join(emotions) if emotions else 'Не выбрано'
             await bot.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=callback_query.message.message_id,
-                text=f"""7/12 ❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько) Выбрано: {selected}""",
+                text=f"""<b>Шаг 7/11\n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b> \n\nВыбрано: {selected}""",
                 reply_markup=get_emotions_keyboard()
             )
 
@@ -3219,7 +3263,7 @@ async def process_step8_basis(message: types.Message, state: FSMContext):
         data['game_basis'] = message.text
     
     await OrderForm.next()
-    await message.answer("""9/12 🌟 Как вы о нас узнали?""", reply_markup=get_source_keyboard())
+    await message.answer("""<b>Шаг 9/11 \n\n🌟 Как вы о нас узнали?</b>""", reply_markup=get_source_keyboard())
 
 # Шаг 9 - источник (inline кнопки)
 @dp.callback_query_handler(lambda c: c.data.startswith('source_'), state=OrderForm.step9_source)
@@ -3240,7 +3284,7 @@ async def process_step9_source(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""10/12 🕕 Как часто вы играете в настольные игры?""",
+        text="""<b>Шаг 10/11\n\n🕕 Как часто вы играете в настольные игры?</b>""",
         reply_markup=get_frequency_keyboard()
     )
 
@@ -3263,35 +3307,35 @@ async def process_step10_frequency(callback_query: types.CallbackQuery, state: F
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""11/12 📝 Опишите игру одним предложением.
-«Это игра о нашем семейном путешествии в Грузию с весёлыми заданиями».""",
+        text="""<b>Шаг 11/11\n\n📝 Опишите игру одним предложением</b>
+\n\n«Это игра о нашем семейном путешествии в Грузию с весёлыми заданиями».""",
         reply_markup=get_cancel_keyboard()
     )
 
-# Шаг 11 - описание
+# Шаг 11 - описание (ФИНАЛЬНЫЙ ШАГ)
 @dp.message_handler(state=OrderForm.step11_description)
 async def process_step11_description(message: types.Message, state: FSMContext):
-    """Шаг 11: Описание игры"""
-    async with state.proxy() as data:
-        data['description'] = message.text
-        data['game_name'] = message.text[:100]  # Используем описание как название
+    """Шаг 11: Описание игры и ЗАВЕРШЕНИЕ"""
     
-    await OrderForm.next()
-    await message.answer("""12/12 📲 Напишите ваш Telegram-ник для быстрой связи
-@username""", reply_markup=get_cancel_keyboard())
+    # Небольшая валидация описания, чтобы не слали пустые сообщения
+    if len(message.text) < 10:
+        return await message.answer("⚠ <b>Описание слишком короткое</b>. Пожалуйста, расскажите подробнее (минимум 10 символов)", 
+                                   reply_markup=get_cancel_keyboard())
 
-# Шаг 12 - Telegram username
-@dp.message_handler(state=OrderForm.step12_telegram)
-async def process_step12_telegram(message: types.Message, state: FSMContext):
-    """Шаг 12: Telegram username"""
     user = await db.get_user(message.from_user.id)
     
+    # Автоматически берем юзернейм из профиля Telegram
+    # Если его нет (не задан в настройках), пишем "Скрыт или не задан"
+    tg_username = f"@{message.from_user.username}" if message.from_user.username else "Юзернейм не задан"
+
     async with state.proxy() as data:
-        data['telegram_username'] = message.text
+        data['description'] = message.text
+        data['game_name'] = message.text[:100]  # Ограничиваем название для красоты в БД
         
-        # Сохраняем заказ в БД
+        # Собираем данные для создания заказа
         order_data = {
             'game_name': data.get('game_name'),
+            'phone': data.get('phone'),
             'occasion': data.get('occasion'),
             'target_audience': data.get('target_audience'),
             'budget': data.get('budget'),
@@ -3301,32 +3345,58 @@ async def process_step12_telegram(message: types.Message, state: FSMContext):
             'source': data.get('source'),
             'play_frequency': data.get('play_frequency'),
             'description': data.get('description'),
-            'telegram_username': data.get('telegram_username')
+            'telegram_username': tg_username # Юзернейм подтянулся САМ
         }
         
-        order = await db.create_order(user['id'], order_data)
-    
-    # Отправляем финальное сообщение
-    complete_text = """✅ Анкета заполнена! Спасибо за ваши ответы!
+        # Сохраняем заказ в БД
+        try:
+            order = await db.create_order(user['id'], order_data)
+            logger.info(f"Заказ создан успешно для пользователя {user['id']}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении заказа: {e}")
+            return await message.answer("❌ Произошла ошибка при сохранении заказа. Пожалуйста, попробуйте позже.")
 
-🎯 Что дальше:
-Я изучу ваши ответы и в течение 24 часов с вами свяжется менеджер для обсуждения концепции и детального расчёта!"""
-    
-    await message.answer(complete_text, reply_markup=get_order_complete_keyboard())
+    # Удаляем состояние ПЕРЕД отправкой финального сообщения
     await state.finish()
+
+    # Отправляем финальное сообщение и ВОЗВРАЩАЕМ нижнее меню
+    # (get_order_complete_keyboard должен вернуть ReplyKeyboardMarkup или Inline с кнопкой в меню)
+    complete_text = (
+        "✅ <b>Анкета успешно заполнена!</b>\n\n"
+        "🎯 <b>Что дальше:</b>\n"
+        "Я изучу ваши ответы и в течение 24 часов с вами свяжется менеджер "
+        "для обсуждения концепции и детального расчёта!"
+    )
+    
+    # Важно: здесь мы возвращаем пользователю ГЛАВНУЮ клавиатуру (нижние кнопки)
+    is_admin = await db.is_admin(user['id'])
+    await message.answer(complete_text, 
+                         parse_mode="HTML", 
+                         reply_markup=get_main_menu_keyboard(is_admin))
 
 # ==================== ОБРАБОТЧИКИ INLINE КНОПОК ====================
 
-@dp.callback_query_handler(lambda c: c.data == 'main_menu')
-async def process_main_menu(callback_query: types.CallbackQuery):
-    """Обработчик кнопки Главное меню"""
+@dp.callback_query_handler(lambda c: c.data == 'main_menu', state='*')
+async def process_main_menu(callback_query: types.CallbackQuery, state: FSMContext):
+    """Универсальный и исправленный обработчик кнопки Главное меню"""
+    await state.finish()
+    await bot.answer_callback_query(callback_query.id)
+    
     user = await db.get_user(callback_query.from_user.id)
     is_admin = await db.is_admin(user['id']) if user else False
     
-    await bot.edit_message_text(
+    try:
+        await bot.delete_message(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id
+        )
+    except Exception:
+        pass 
+
+    await bot.send_message(
         chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        text="📌 ГЛАВНОЕ МЕНЮ:",
+        text="📌 <b>ГЛАВНОЕ МЕНЮ:</b>",
+        parse_mode="HTML",
         reply_markup=get_main_menu_keyboard(is_admin)
     )
 
