@@ -47,9 +47,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS").split(",")]
-DB_URL = os.getenv("DATABASE_URL")
+# TOKEN = os.getenv("BOT_TOKEN")
+# ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS").split(",")]
+# DB_URL = os.getenv("DATABASE_URL")
+
+TOKEN = "8431935487:AAFBSEtd1uU6h2rAf7vwlNKLguZYSNtuIXE"
+ADMIN_IDS = [6058083243]
+DB_URL = "postgresql://postgres.bpthaiaqbgephptsclix:Prokopenko_772@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"
 
 bot = Bot(token=TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
@@ -575,6 +579,158 @@ class Database:
         async with self.pool.acquire() as conn:
             user = await conn.fetchrow('SELECT * FROM users WHERE id = $1', user_id)
             return dict(user) if user else None
+
+    async def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """Найти пользователя в базе по его юзернейму"""
+        async with self.pool.acquire() as conn:
+            # Используем ILIKE для поиска без учета регистра (Pavel = pavel)
+            user = await conn.fetchrow('''
+                SELECT * FROM users WHERE username ILIKE $1
+            ''', username)
+            return dict(user) if user else None
+        
+
+    # ========================= АДМИНКА ==========================
+
+    async def add_admin(self, target: str, assigned_by_tg_id: int):
+        async with self.pool.acquire() as conn:
+            # 1. Получаем внутренний ID владельца (безопасно)
+            admin_row = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", assigned_by_tg_id)
+            admin_id = admin_row['id'] if admin_row else None
+
+            # 2. Ищем того, кого назначаем
+            user_row = None
+            if not str(target).isdigit():
+                # Если ввели юзернейм
+                username = str(target).replace('@', '').strip()
+                user_row = await conn.fetchrow("SELECT id, telegram_id FROM users WHERE username = $1", username)
+            else:
+                # Если ввели цифры
+                tg_id_val = int(target)
+                # Сначала ищем по telegram_id (он BIGINT)
+                user_row = await conn.fetchrow("SELECT id, telegram_id FROM users WHERE telegram_id = $1", tg_id_val)
+                
+                # Если не нашли и число маленькое, проверяем как внутренний id
+                if not user_row and tg_id_val < 2147483647:
+                    user_row = await conn.fetchrow("SELECT id, telegram_id FROM users WHERE id = $1", tg_id_val)
+
+            if not user_row:
+                return False, None
+
+            target_internal_id = user_row['id']
+            target_tg_id = user_row['telegram_id']
+
+            # 3. Проверка: не админ ли он уже?
+            is_already = await conn.fetchval("SELECT 1 FROM admins WHERE user_id = $1", target_internal_id)
+            if is_already:
+                return "already", target_tg_id
+
+            # 4. Добавляем новую запись
+            try:
+                await conn.execute("""
+                    INSERT INTO admins (user_id, added_by) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, target_internal_id, admin_id)
+                
+                return True, target_tg_id
+            except Exception as e:
+                print(f"Ошибка БД при добавлении: {e}")
+                return "error", None
+
+    async def is_owner(self, telegram_id: int) -> bool:
+        """Проверка: является ли пользователь владельцем (из конфига)"""
+        return telegram_id in ADMIN_IDS
+
+    async def is_admin(self, telegram_id: int) -> bool:
+        """Проверка: является ли пользователь админом (владелец ИЛИ из БД)"""
+        if await self.is_owner(telegram_id):
+            return True
+            
+        async with self.pool.acquire() as conn:
+            query = """
+                SELECT EXISTS(
+                    SELECT 1 FROM admins a
+                    JOIN users u ON a.user_id = u.id
+                    WHERE u.telegram_id = $1
+                )
+            """
+            return await conn.fetchval(query, telegram_id)
+
+    async def get_all_admins(self):
+        async with self.pool.acquire() as conn:
+            query = """
+                SELECT 
+                    COALESCE(u.telegram_id, a.user_id) as display_id, 
+                    u.full_name, 
+                    u.username, 
+                    a.added_at
+                FROM admins a
+                LEFT JOIN users u ON (a.user_id = u.id OR a.user_id = u.telegram_id)
+                ORDER BY a.added_at DESC
+            """
+            rows = await conn.fetch(query)
+            return rows
+
+    async def remove_admin(self, target: str, removed_by_tg_id: int):
+        async with self.pool.acquire() as conn:
+            user_row = None
+            
+            # 1. Поиск пользователя (защищенный от ошибок диапазона чисел)
+            if not str(target).isdigit():
+                # Если ввели юзернейм
+                username = str(target).replace('@', '').strip()
+                user_row = await conn.fetchrow(
+                    "SELECT id, telegram_id FROM users WHERE username = $1", 
+                    username
+                )
+            else:
+                # Если ввели ID
+                tg_id_val = int(target)
+                # Сначала ищем по telegram_id (он BIGINT и выдержит большие числа)
+                user_row = await conn.fetchrow(
+                    "SELECT id, telegram_id FROM users WHERE telegram_id = $1", 
+                    tg_id_val
+                )
+                
+                # Если не нашли, и число маленькое, проверяем как внутренний ID
+                if not user_row and tg_id_val < 2147483647:
+                    user_row = await conn.fetchrow(
+                        "SELECT id, telegram_id FROM users WHERE id = $1", 
+                        tg_id_val
+                    )
+
+            if not user_row:
+                return "not_found", None
+
+            target_internal_id = user_row['id']
+            target_tg_id = user_row['telegram_id']
+
+            # 2. Удаление из таблицы admins
+            # Удаляем по внутреннему ID, так как это надежнее
+            result = await conn.execute(
+                "DELETE FROM admins WHERE user_id = $1", 
+                target_internal_id
+            )
+            
+            if result == "DELETE 0":
+                return "not_admin", None
+
+            # 3. Логирование действия (через внутренний ID владельца)
+            try:
+                admin_row = await conn.fetchrow(
+                    "SELECT id FROM users WHERE telegram_id = $1", 
+                    removed_by_tg_id
+                )
+                if admin_row:
+                    await self.log_activity(
+                        admin_row['id'], 
+                        'admin_removed', 
+                        {'removed_user_id': target_internal_id}
+                    )
+            except Exception as e:
+                print(f"Ошибка логирования: {e}")
+
+            return True, target_tg_id
     
     async def create_user(self, telegram_id: int, username: str, full_name: str, referrer_code: str = None) -> Dict:
         """Создать нового пользователя"""
@@ -752,21 +908,7 @@ class Database:
         )
         
         return dict(order)
-    
-    async def get_user_orders(self, user_id: int, limit: int = 10) -> List[Dict]:
-        """Получить заказы пользователя"""
-        async with self.pool.acquire() as conn:
-            orders = await conn.fetch('''
-                SELECT o.*, 
-                       (SELECT COUNT(*) FROM order_stages WHERE order_id = o.id AND completed = TRUE) as completed_stages
-                FROM orders o
-                WHERE o.user_id = $1
-                ORDER BY o.created_at DESC
-                LIMIT $2
-            ''', user_id, limit)
-            
-            return [dict(order) for order in orders]
-    
+
     async def get_order(self, order_id: int) -> Optional[Dict]:
         """Получить заказ по ID"""
         async with self.pool.acquire() as conn:
@@ -2022,50 +2164,45 @@ class Database:
     
     # ==================== АДМИНИСТРАТОРЫ ====================
     
-    async def is_admin(self, user_id: int) -> bool:
-        """Проверить, является ли пользователь администратором"""
-        async with self.pool.acquire() as conn:
-            is_admin = await conn.fetchval('SELECT 1 FROM admins WHERE user_id = $1', user_id)
-            return bool(is_admin)
     
-    async def get_admin_username(self, admin_id: int) -> Optional[str]:
-        """Получить username администратора"""
-        async with self.pool.acquire() as conn:
-            username = await conn.fetchval('SELECT username FROM users WHERE id = $1', admin_id)
-            return username
+    # async def get_admin_username(self, admin_id: int) -> Optional[str]:
+    #     """Получить username администратора"""
+    #     async with self.pool.acquire() as conn:
+    #         username = await conn.fetchval('SELECT username FROM users WHERE id = $1', admin_id)
+    #         return username
     
-    async def add_admin(self, user_id: int, added_by: int, permissions: List[str] = None) -> bool:
-        """Добавить администратора"""
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO admins (user_id, added_by, permissions)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    permissions = EXCLUDED.permissions,
-                    added_at = CURRENT_TIMESTAMP
-            ''', user_id, added_by, json.dumps(permissions or ['all']))
+    # async def add_admin(self, user_id: int, added_by: int, permissions: List[str] = None) -> bool:
+    #     """Добавить администратора"""
+    #     async with self.pool.acquire() as conn:
+    #         await conn.execute('''
+    #             INSERT INTO admins (user_id, added_by, permissions)
+    #             VALUES ($1, $2, $3)
+    #             ON CONFLICT (user_id) DO UPDATE SET
+    #                 permissions = EXCLUDED.permissions,
+    #                 added_at = CURRENT_TIMESTAMP
+    #         ''', user_id, added_by, json.dumps(permissions or ['all']))
             
-            await self.log_activity(added_by, 'admin_added', {'added_user_id': user_id})
-            return True
+    #         await self.log_activity(added_by, 'admin_added', {'added_user_id': user_id})
+    #         return True
     
-    async def remove_admin(self, user_id: int, removed_by: int) -> bool:
-        """Удалить администратора"""
-        async with self.pool.acquire() as conn:
-            await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
-            await self.log_activity(removed_by, 'admin_removed', {'removed_user_id': user_id})
-            return True
+    # async def remove_admin(self, user_id: int, removed_by: int) -> bool:
+    #     """Удалить администратора"""
+    #     async with self.pool.acquire() as conn:
+    #         await conn.execute('DELETE FROM admins WHERE user_id = $1', user_id)
+    #         await self.log_activity(removed_by, 'admin_removed', {'removed_user_id': user_id})
+    #         return True
     
-    async def get_admins(self) -> List[Dict]:
-        """Получить список администраторов"""
-        async with self.pool.acquire() as conn:
-            admins = await conn.fetch('''
-                SELECT a.*, u.full_name, u.username, u.telegram_id
-                FROM admins a
-                JOIN users u ON a.user_id = u.id
-                ORDER BY a.added_at
-            ''')
+    # async def get_admins(self) -> List[Dict]:
+    #     """Получить список администраторов"""
+    #     async with self.pool.acquire() as conn:
+    #         admins = await conn.fetch('''
+    #             SELECT a.*, u.full_name, u.username, u.telegram_id
+    #             FROM admins a
+    #             JOIN users u ON a.user_id = u.id
+    #             ORDER BY a.added_at
+    #         ''')
             
-            return [dict(admin) for admin in admins]
+    #         return [dict(admin) for admin in admins]
     
     # ==================== ЧЕКИ ====================
     
@@ -2401,19 +2538,24 @@ class Database:
     # ==================== ЛОГИРОВАНИЕ ====================
     
     async def log_activity(self, user_id: Optional[int], action_type: str, details: Dict = None):
-        """Записать действие в лог"""
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO activity_log (user_id, action_type, details)
-                VALUES ($1, $2, $3)
-            ''', user_id, action_type, json.dumps(details or {}))
-            
-            # Обновляем last_active для пользователя
-            if user_id:
+        """Записать действие в лог безопасно"""
+        try:
+            async with self.pool.acquire() as conn:
+                # Записываем в лог
                 await conn.execute('''
-                    UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = $1
-                ''', user_id)
-    
+                    INSERT INTO activity_log (user_id, action_type, details)
+                    VALUES ($1, $2, $3)
+                ''', user_id, action_type, json.dumps(details or {}))
+                
+                # Обновляем активность только по telegram_id
+                if user_id:
+                    await conn.execute('''
+                        UPDATE users SET last_active = CURRENT_TIMESTAMP 
+                        WHERE telegram_id = $1
+                    ''', user_id)
+        except Exception as e:
+            print(f"Ошибка логирования (не критично): {e}")
+
     # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
     
     async def get_user_referral_stats(self, user_id: int) -> Dict:
@@ -2554,16 +2696,17 @@ db = Database()
 class OrderForm(StatesGroup):
     step1_name = State()
     step2_phone = State()
-    step3_date = State()
-    step4_target = State()
-    step5_budget = State()
-    step6_players = State()
-    step7_emotions = State()
-    step8_basis = State()
-    step9_source = State()
-    step10_frequency = State()
-    step11_description = State()
-    step12_telegram = State()
+    step3_name_game = State()
+    step4_date = State()
+    step5_target = State()
+    step6_budget = State()
+    step7_players = State()
+    step8_emotions = State()
+    step9_basis = State()
+    step10_source = State()
+    step11_frequency = State()
+    step12_description = State()
+    confirm_order = State()  
 
 class ProfileEditForm(StatesGroup):
     edit_name = State()
@@ -3014,7 +3157,7 @@ async def start_order_creation(message: types.Message, state: FSMContext):
     
     await message.answer(
         "<b>Начинаем создание вашей игры!</b>\n\n"
-        "<b>Шаг 1/11:</b>\n"
+        "<b>Шаг 1/12:</b>\n\n"
         "👤 Как вас зовут?\n"
         "Укажите имя для обращения в работе",
         parse_mode="HTML",
@@ -3054,6 +3197,116 @@ async def admin_panel(message: types.Message):
     
     await message.answer(admin_text, reply_markup=get_admin_keyboard())
 
+
+
+# ==================== ХЕНДЛЕРЫ ДЛЯ АДМИНА ====================
+
+# Команда для назначения админов
+@dp.message_handler(commands=['make_admin'])
+async def cmd_make_admin(message: types.Message):
+    if not await db.is_owner(message.from_user.id):
+        return await message.answer("🚫 Только владелец может это делать.")
+
+    target = message.get_args()
+    if not target:
+        return await message.answer("Укажите @username или ID")
+
+    # Вызываем метод
+    result, target_tg_id = await db.add_admin(target, message.from_user.id)
+
+    if result == True:
+        # ТВОЙ ТЕКСТ:
+        await message.answer(f"✅ Пользователь <b>{target}</b> успешно назначен администратором")
+        
+        # ОТПРАВКА УВЕДОМЛЕНИЯ (ТВОЙ ТЕКСТ):
+        try:
+            owner = f"@{message.from_user.username}" if message.from_user.username else "Владелец"
+            await bot.send_message(target_tg_id, f"Вы назначены администратором, благодаря Господину {owner}\n")
+        except:
+            pass
+            
+    elif result == "already":
+        await message.answer(f"ℹ️ Пользователь <b>{target}</b> уже является администратором.")
+        
+    else:
+        await message.answer("❌ Ошибка: пользователь не найден.")
+
+@dp.message_handler(commands=['admin_test'])
+async def test_admin(message: types.Message): 
+    is_admin = await db.is_admin(message.from_user.id)
+
+    if is_admin:
+        await message.answer("✅ Система видит вас как АДМИНИСТРАТОРА!")
+    else:
+        await message.answer("❌ Система видит вас как ОБЫЧНОГО пользователя")
+
+
+@dp.message_handler(commands=['admins'])
+async def cmd_list_admins(message: types.Message):
+    if not await db.is_admin(message.from_user.id):
+        return await message.answer("🚫 У вас нет прав для просмотра списка")
+
+    text = "<b>👑 Список администраторов:</b>\n\n"
+    
+    text += "<b>📍 Владельцы:</b>\n"
+    for admin_id in ADMIN_IDS:
+        user = await db.pool.fetchrow("SELECT full_name, username FROM users WHERE telegram_id = $1", admin_id)
+        if user:
+            name = user['full_name']
+            username = f"@{user['username']}" if user['username'] else ""
+            text += f"{name} - {username} (ID: <code>{admin_id}</code>)\n"
+        else:
+            text += f"Владелец <code>{admin_id}</code>\n"
+    
+    db_admins = await db.get_all_admins()
+    
+    text += "\n<b>👥 Назначенные администраторы:</b>\n"
+    if db_admins:
+        for row in db_admins:
+            name = row['full_name'] or "Неизвестный (не нажал /start)"
+            username = f" @{row['username']}" if row['username'] else ""
+            date_str = row['added_at'].strftime("%d.%m.%Y") if row['added_at'] else "—"
+            
+            text += f"{name}{username}\n"
+            text += f"(ID: <code>{row['display_id']}</code>) | с {date_str}\n"
+    else:
+        text += "<i>Назначенных администраторов пока нет.</i>"
+
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message_handler(commands=['rm_admin'])
+async def cmd_remove_admin(message: types.Message):
+    # 1. Проверка прав: только владелец может удалять
+    if not await db.is_owner(message.from_user.id):
+        return await message.answer("🚫 Только владелец может это делать.")
+
+    target = message.get_args()
+    if not target:
+        return await message.answer("Укажите @username или ID для удаления.")
+
+    # 2. Вызываем метод удаления
+    result, target_tg_id = await db.remove_admin(target, message.from_user.id)
+
+    if result == True:
+        await message.answer(f"✅ Пользователь <b>{target}</b> удален из списка администраторов.")
+        
+        # 3. ОТПРАВКА УВЕДОМЛЕНИЯ УДАЛЕННОМУ (ТВОЙ ТЕКСТ)
+        try:
+            owner = f"@{message.from_user.username}" if message.from_user.username else "Владелец"
+            await bot.send_message(
+                target_tg_id, 
+                f"Вы были лишены прав администратора, Господином {owner}\n"
+            )
+        except:
+            # Если бот заблокирован пользователем
+            pass
+
+    elif result == "not_admin":
+        await message.answer(f"ℹ️ Пользователь <b>{target}</b> не является администратором.")
+    else:
+        await message.answer("❌ Ошибка: пользователь не найден в базе данных.")
+
 # ==================== ОБРАБОТЧИКИ АНКЕТЫ (12 ШАГОВ) ====================
 
 @dp.message_handler(state=OrderForm.step1_name)
@@ -3069,7 +3322,7 @@ async def process_step1_name(message: types.Message, state: FSMContext):
     
     await OrderForm.next()
     await message.answer(
-        "<b>Шаг 2/11</b>\n\n📞 <b>Ваш контактный телефон для связи?</b>\n"
+        "<b>Шаг 2/12</b>\n\n📞 <b>Ваш контактный телефон для связи?</b>\n"
         "\nВведите в формате: <code>+7XXXXXXXXXX</code>\n", 
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard()
@@ -3110,15 +3363,33 @@ async def process_step2_phone(message: types.Message, state: FSMContext):
     
     await OrderForm.next()
     await message.answer(
-        "<b>Шаг 3/11</b>\n\n📅 <b>Для какого события или даты создаётся игра?</b>\n"
+        "<b>Шаг 3/12</b>\n\n🎮 <b>Какое будет название у игры?</b>\n",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@dp.message_handler(state=OrderForm.step3_name_game)
+async def process_step3_name_game(message: types.Message, state: FSMContext):
+    """Шаг 3: Имя игры"""
+    game_name = message.text.strip() if message.text else ""
+    if not game_name or len(game_name) < 2:
+        return await message.answer("❌ <b>Введите название игры (мин. 2 символа)</b>", parse_mode="HTML")
+    
+    async with state.proxy() as data:
+        data['game_name_input'] = game_name 
+
+    # ВАЖНО: Ведем на step3_date (как у тебя назван хендлер ниже)
+    await OrderForm.step4_date.set()
+    await message.answer(
+        "<b>Шаг 4/12</b>\n\n📅 <b>Для какого события или даты создаётся игра?</b>\n"
         "\nНапример: «Юбилей 15.08.2024»", 
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard()
     )
 
-@dp.message_handler(state=OrderForm.step3_date)
-async def process_step3_date(message: types.Message, state: FSMContext):
-    """Шаг 3: Дата события (с валидацией)"""
+@dp.message_handler(state=OrderForm.step4_date)
+async def process_step4_date(message: types.Message, state: FSMContext):
+    """Шаг 4: Дата события (с валидацией)"""
     text = message.text.strip()
 
     if len(text) < 5:
@@ -3134,15 +3405,14 @@ async def process_step3_date(message: types.Message, state: FSMContext):
     
     await OrderForm.next()
     await message.answer(
-        "<b>Шаг 4/11</b>\n\n🎁 <b>Для кого предназначена игра?</b>\n"
+        "<b>Шаг 5/12</b>\n\n🎁 <b>Для кого предназначена игра?</b>\n"
         "\n(Выберите вариант или введите свой)", 
         reply_markup=get_target_audience_keyboard()
     )
 
-# Шаг 4 - выбор целевой аудитории (inline кнопки)
-@dp.callback_query_handler(lambda c: c.data.startswith('target_'), state=OrderForm.step4_target)
-async def process_step4_target(callback_query: types.CallbackQuery, state: FSMContext):
-    """<b>Шаг 4: Целевая аудитория</b>"""
+@dp.callback_query_handler(lambda c: c.data.startswith('target_'), state=OrderForm.step5_target)
+async def process_step5_target(callback_query: types.CallbackQuery, state: FSMContext):
+    """<b>Шаг 5: Целевая аудитория</b>"""
     target_map = {
         'target_family': 'Для семьи',
         'target_couple': 'Для второй половинки',
@@ -3158,14 +3428,14 @@ async def process_step4_target(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""<b>Шаг 5/11 \n\n💰 Каков ваш ориентировочный бюджет?</b>""",
+        text="""<b>Шаг 6/12 \n\n💰 Каков ваш ориентировочный бюджет?</b>""",
         reply_markup=get_budget_keyboard()
     )
 
 # Шаг 5 - бюджет (inline кнопки)
-@dp.callback_query_handler(lambda c: c.data.startswith('budget_'), state=OrderForm.step5_budget)
-async def process_step5_budget(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 5: Бюджет"""
+@dp.callback_query_handler(lambda c: c.data.startswith('budget_'), state=OrderForm.step6_budget)
+async def process_step6_budget(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 6: Бюджет"""
     budget_map = {
         'budget_5000': 'До 5.000₽',
         'budget_10000': 'До 10.000₽',
@@ -3181,14 +3451,14 @@ async def process_step5_budget(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="<b>Шаг 6/11 \n\n🔢 Сколько игроков будет играть одновременно?</b>",
+        text="<b>Шаг 7/12 \n\n🔢 Сколько игроков будет играть одновременно?</b>",
         reply_markup=get_players_keyboard()
     )
 
 # Шаг 6 - количество игроков (inline кнопки)
-@dp.callback_query_handler(lambda c: c.data.startswith('players_'), state=OrderForm.step6_players)
-async def process_step6_players(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 6: Количество игроков"""
+@dp.callback_query_handler(lambda c: c.data.startswith('players_'), state=OrderForm.step7_players)
+async def process_step7_players(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 7: Количество игроков"""
     players_map = {
         'players_2_6': '2-6 игроков',
         'players_6_12': '6-12 игроков',
@@ -3204,14 +3474,14 @@ async def process_step6_players(callback_query: types.CallbackQuery, state: FSMC
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""<b>Шаг 7/11 \n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b>""",
+        text="""<b>Шаг 8/12 \n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b>""",
         reply_markup=get_emotions_keyboard()
     )
 
 # Шаг 7 - эмоции (множественный выбор)
-@dp.callback_query_handler(lambda c: c.data.startswith('emotion_') or c.data == 'emotions_next', state=OrderForm.step7_emotions)
-async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 7: Эмоции (множественный выбор)"""
+@dp.callback_query_handler(lambda c: c.data.startswith('emotion_') or c.data == 'emotions_next', state=OrderForm.step8_emotions)
+async def process_step8_emotions(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 8: Эмоции (множественный выбор)"""
     emotion_map = {
         'emotion_fun': 'Веселье и смех',
         'emotion_warmth': 'Тепло и ностальгия',
@@ -3233,7 +3503,7 @@ async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSM
             await bot.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=callback_query.message.message_id,
-                text="""<b>Шаг 8/11 \n\n🎯 На основе какой игры вы хотите создать свою?</b>
+                text="""<b>Шаг 9/12 \n\n🎯 На основе какой игры вы хотите создать свою?</b>
 \nНапример: «Монополия», «Алиас», «Крокодил» или своя уникальная механика.""",
                 reply_markup=get_cancel_keyboard()
             )
@@ -3252,23 +3522,23 @@ async def process_step7_emotions(callback_query: types.CallbackQuery, state: FSM
             await bot.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=callback_query.message.message_id,
-                text=f"""<b>Шаг 7/11\n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b> \n\nВыбрано: {selected}""",
+                text=f"""<b>Шаг 7/12\n\n❤️ Какие эмоции должна вызывать игра? (можно выбрать несколько)</b> \n\nВыбрано: {selected}""",
                 reply_markup=get_emotions_keyboard()
             )
 
-@dp.message_handler(state=OrderForm.step8_basis)
-async def process_step8_basis(message: types.Message, state: FSMContext):
-    """Шаг 8: Основа игры"""
+@dp.message_handler(state=OrderForm.step9_basis)
+async def process_step9_basis(message: types.Message, state: FSMContext):
+    """Шаг 9: Основа игры"""
     async with state.proxy() as data:
         data['game_basis'] = message.text
     
     await OrderForm.next()
-    await message.answer("""<b>Шаг 9/11 \n\n🌟 Как вы о нас узнали?</b>""", reply_markup=get_source_keyboard())
+    await message.answer("""<b>Шаг 10/12 \n\n🌟 Как вы о нас узнали?</b>""", reply_markup=get_source_keyboard())
 
 # Шаг 9 - источник (inline кнопки)
-@dp.callback_query_handler(lambda c: c.data.startswith('source_'), state=OrderForm.step9_source)
-async def process_step9_source(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 9: Источник"""
+@dp.callback_query_handler(lambda c: c.data.startswith('source_'), state=OrderForm.step10_source)
+async def process_step10_source(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 10: Источник"""
     source_map = {
         'source_social': 'Соцсети',
         'source_referral': 'Реферальная система',
@@ -3284,14 +3554,14 @@ async def process_step9_source(callback_query: types.CallbackQuery, state: FSMCo
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""<b>Шаг 10/11\n\n🕕 Как часто вы играете в настольные игры?</b>""",
+        text="""<b>Шаг 11/12\n\n🕕 Как часто вы играете в настольные игры?</b>""",
         reply_markup=get_frequency_keyboard()
     )
 
 # Шаг 10 - частота игры (inline кнопки)
-@dp.callback_query_handler(lambda c: c.data.startswith('frequency_'), state=OrderForm.step10_frequency)
-async def process_step10_frequency(callback_query: types.CallbackQuery, state: FSMContext):
-    """Шаг 10: Частота игры"""
+@dp.callback_query_handler(lambda c: c.data.startswith('frequency_'), state=OrderForm.step11_frequency)
+async def process_step11_frequency(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 11: Частота игры"""
     frequency_map = {
         'frequency_never': 'Не играю, но хочу начать',
         'frequency_rare': 'Редко, по особым случаям',
@@ -3307,72 +3577,106 @@ async def process_step10_frequency(callback_query: types.CallbackQuery, state: F
     await bot.edit_message_text(
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        text="""<b>Шаг 11/11\n\n📝 Опишите игру одним предложением</b>
+        text="""<b>Шаг 12/12\n\n📝 Опишите игру одним предложением</b>
 \n\n«Это игра о нашем семейном путешествии в Грузию с весёлыми заданиями».""",
         reply_markup=get_cancel_keyboard()
     )
 
 # Шаг 11 - описание (ФИНАЛЬНЫЙ ШАГ)
-@dp.message_handler(state=OrderForm.step11_description)
-async def process_step11_description(message: types.Message, state: FSMContext):
-    """Шаг 11: Описание игры и ЗАВЕРШЕНИЕ"""
-    
-    # Небольшая валидация описания, чтобы не слали пустые сообщения
+@dp.message_handler(state=OrderForm.step12_description)
+async def process_step12_description(message: types.Message, state: FSMContext):
     if len(message.text) < 10:
-        return await message.answer("⚠ <b>Описание слишком короткое</b>. Пожалуйста, расскажите подробнее (минимум 10 символов)", 
-                                   reply_markup=get_cancel_keyboard())
-
-    user = await db.get_user(message.from_user.id)
-    
-    # Автоматически берем юзернейм из профиля Telegram
-    # Если его нет (не задан в настройках), пишем "Скрыт или не задан"
-    tg_username = f"@{message.from_user.username}" if message.from_user.username else "Юзернейм не задан"
+        return await message.answer("⚠ Описание слишком короткое. Напишите подробнее.")
 
     async with state.proxy() as data:
         data['description'] = message.text
-        data['game_name'] = message.text[:100]  # Ограничиваем название для красоты в БД
+        game_title = data.get('game_name_input', 'Без названия')
         
-        # Собираем данные для создания заказа
-        order_data = {
-            'game_name': data.get('game_name'),
-            'phone': data.get('phone'),
-            'occasion': data.get('occasion'),
-            'target_audience': data.get('target_audience'),
-            'budget': data.get('budget'),
-            'players_count': data.get('players_count'),
-            'emotions': data.get('emotions', []),
-            'game_basis': data.get('game_basis'),
-            'source': data.get('source'),
-            'play_frequency': data.get('play_frequency'),
-            'description': data.get('description'),
-            'telegram_username': tg_username # Юзернейм подтянулся САМ
-        }
+        # Превращаем список эмоций в строку через запятую
+        emotions_str = ", ".join(data.get('emotions', [])) if data.get('emotions') else "Не выбраны"
+
+        preview_text = (
+            "<b>🔍 Проверьте вашу заявку:</b>\n\n"
+            f"👤 <b>Имя:</b> {data.get('name')}\n"
+            f"📱 <b>Телефон:</b> {data.get('phone')}\n"
+            f"🎮 <b>Название игры:</b> {game_title}\n"
+            f"📅 <b>Повод:</b> {data.get('occasion')}\n"
+            f"👥 <b>Аудитория:</b> {data.get('target_audience')}\n"
+            f"💰 <b>Бюджет:</b> {data.get('budget')}\n"
+            f"🔢 <b>Игроков:</b> {data.get('players_count')}\n"
+            f"❤️ <b>Эмоции:</b> {emotions_str}\n"
+            f"🎯 <b>Основа (механика):</b> {data.get('game_basis')}\n"
+            f"🕕 <b>Опыт в играх:</b> {data.get('play_frequency')}\n"
+            f"🌟 <b>Источник:</b> {data.get('source')}\n"
+            f"📝 <b>Описание:</b> {data.get('description')}\n\n"
+            "<b>Все верно? Отправляем заявку на одобрение?</b>"
+        )
+
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("✅ Да, отправить"), types.KeyboardButton("❌ Заполнить заново"))
+
+    await OrderForm.confirm_order.set()
+    await message.answer(preview_text, parse_mode="HTML", reply_markup=kb)
+
+@dp.message_handler(state=OrderForm.confirm_order)
+async def process_confirm(message: types.Message, state: FSMContext):
+    if message.text == "❌ Заполнить заново":
+        # Очищаем данные старой анкеты, чтобы начать с чистого листа
+        await state.finish() 
+        # Снова включаем первое состояние
+        await OrderForm.step1_name.set() 
         
-        # Сохраняем заказ в БД
-        try:
-            order = await db.create_order(user['id'], order_data)
-            logger.info(f"Заказ создан успешно для пользователя {user['id']}")
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении заказа: {e}")
-            return await message.answer("❌ Произошла ошибка при сохранении заказа. Пожалуйста, попробуйте позже.")
+        return await message.answer(
+            "<b>Хорошо, начнем сначала</b>\n\n<b>Шаг 1/12:</b>\n\n👤 Как вас зовут?",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
 
-    # Удаляем состояние ПЕРЕД отправкой финального сообщения
-    await state.finish()
+    if message.text == "✅ Да, отправить":
+        user = await db.get_user(message.from_user.id)
+        tg_username = f"@{message.from_user.username}" if message.from_user.username else "Скрыт"
 
-    # Отправляем финальное сообщение и ВОЗВРАЩАЕМ нижнее меню
-    # (get_order_complete_keyboard должен вернуть ReplyKeyboardMarkup или Inline с кнопкой в меню)
-    complete_text = (
-        "✅ <b>Анкета успешно заполнена!</b>\n\n"
-        "🎯 <b>Что дальше:</b>\n"
-        "Я изучу ваши ответы и в течение 24 часов с вами свяжется менеджер "
-        "для обсуждения концепции и детального расчёта!"
-    )
-    
-    # Важно: здесь мы возвращаем пользователю ГЛАВНУЮ клавиатуру (нижние кнопки)
-    is_admin = await db.is_admin(user['id'])
-    await message.answer(complete_text, 
-                         parse_mode="HTML", 
-                         reply_markup=get_main_menu_keyboard(is_admin))
+        async with state.proxy() as data:
+            order_data = {
+                'phone': data.get('phone'),
+                'game_name': data.get('game_name_input'), 
+                'occasion': data.get('occasion'),
+                'target_audience': data.get('target_audience'),
+                'budget': data.get('budget'),
+                'players_count': data.get('players_count'),
+                'emotions': data.get('emotions', []),
+                'game_basis': data.get('game_basis'),
+                'source': data.get('source'),
+                'play_frequency': data.get('play_frequency'),
+                'description': data.get('description'),
+                'telegram_username': tg_username
+            }
+            
+            try:
+                order = await db.create_order(user['id'], order_data)
+                
+                await state.finish()
+                is_admin = await db.is_admin(user['id'])
+                await message.answer("🚀 <b>Заявка отправлена!</b> Менеджер свяжется с вами.", 
+                                   parse_mode="HTML", reply_markup=get_main_menu_keyboard(is_admin))
+                
+                admin_text = (
+                    f"🔔 <b>НОВАЯ ЗАЯВКА НА ОДОБРЕНИЕ!</b>\n\n"
+                    f"👤 Отправитель: {user['full_name']}\n"
+                    f"📱 Телефон: {order_data['phone']}\n"
+                    f"🆔 Номер заказа: <code>{order['order_number']}</code>\n"
+                    f"📝 Название: {order_data['game_name']}"
+                )
+                
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, admin_text, parse_mode="HTML")
+                    except:
+                        continue
+
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await message.answer("❌ Ошибка при отправке.")
 
 # ==================== ОБРАБОТЧИКИ INLINE КНОПОК ====================
 
@@ -3882,8 +4186,8 @@ async def process_profile_stats(callback_query: types.CallbackQuery):
     stats_text = f"""📊 ВАША СТАТИСТИКА
 
 Общая информация:
-🎮 Всего заказов: {stats.get('total_orders_count', 0)}
-📦 Активный заказ: #{active_order['order_number'] if active_order else 'Нет активных'}
+🎮 Всего заявок: {stats.get('total_orders_count', 0)}
+📦 Активный заявка: #{active_order['order_number'] if active_order else 'Нет активных'}
 👥 Приглашено клиентов: {stats.get('referrals_count', 0)}
 💎 Накоплено бонусов: {user.get('balance', 0)}₽
 
