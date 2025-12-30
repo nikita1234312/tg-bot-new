@@ -52,12 +52,25 @@ logger = logging.getLogger(__name__)
 # DB_URL = os.getenv("DATABASE_URL")
 
 TOKEN = "8431935487:AAFBSEtd1uU6h2rAf7vwlNKLguZYSNtuIXE"
-ADMIN_IDS = [6058083243]
+ADMIN_IDS = [6058083243] #, 1245938715]
 DB_URL = "postgresql://postgres.bpthaiaqbgephptsclix:Prokopenko_772@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"
 
 bot = Bot(token=TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+
+
+STAGES = {
+    1: "📊 Анализ требований",
+    2: "💡 Разработка концепции",
+    3: "🎨 Дизайн игрового поля",
+    4: "🛠 Создание прототипа",
+    5: "⚖️ Балансировка процесса",
+    6: "📦 Дизайн компонентов",
+    7: "📝 Финальные правки",
+    8: "🚀 Подготовка к отправке",
+    9: "✅ Завершено"
+}
 
 
 # ==================== ДОП ФУНКЦИИ  ====================
@@ -66,7 +79,11 @@ async def notify_admins_new_order(user: types.User, order_content: str):
     admin_ids = await db.get_admin_recipients()
     username = f"@{user.username}" if user.username else "Скрыт"
     
-    # Текст сообщения (используем то, что пришло в order_content + данные юзера)
+    # 1. Достаем номер заявки (order_key) из текста анкеты
+    # Ищем что-то похожее на №SG12345...
+    order_match = re.search(r'№([A-Z0-9]+)', order_content)
+    order_key = order_match.group(1) if order_match else f"msg_{user.id}"
+
     text = (
         f"{order_content}\n"
         f"👤 <b>Клиент:</b> {user.full_name} ({username})\n"
@@ -83,13 +100,38 @@ async def notify_admins_new_order(user: types.User, order_content: str):
 
     for admin_id in admin_ids:
         try:
-            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+            # 2. Отправляем и получаем объект сообщения
+            msg = await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+            
+            # 3. ЗАПИСЫВАЕМ В БАЗУ: какой админ какое сообщение получил по этой заявке
+            async with db.pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO order_messages (order_key, admin_tg_id, message_id)
+                    VALUES ($1, $2, $3)
+                """, order_key, admin_id, msg.message_id)
+                
         except Exception as e:
             print(f"Ошибка рассылки админу {admin_id}: {e}")
+
+
+async def delete_prev_messages(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()  # Удаляем ответ пользователя
+    except:
+        pass
+    
+    data = await state.get_data()
+    last_msg_id = data.get("last_bot_msg_id")
+    if last_msg_id:
+        try:
+            await bot.delete_message(message.chat.id, last_msg_id)  # Удаляем вопрос бота
+        except:
+            pass
 # ==================== БАЗА ДАННЫХ ====================
 class Database:
     def __init__(self):
         self.pool = None
+        self.stats_cache = {}
     
     async def connect(self):
         """Установка соединения с базой данных (Supabase IPv4 Pooler)"""
@@ -195,6 +237,15 @@ class Database:
                     completed_at TIMESTAMP,
                     
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            await conn.execute('''
+            CREATE TABLE IF NOT EXISTS order_messages (
+                id SERIAL PRIMARY KEY,
+                order_key TEXT NOT NULL,
+                admin_tg_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL
                 )
             ''')
             
@@ -2767,22 +2818,25 @@ class PayoutForm(StatesGroup):
     enter_card_holder = State()
 
 class AdminStates(StatesGroup):
-    add_consultation_slot_date = State()
-    add_consultation_slot_time = State()
-    add_portfolio_title = State()
-    add_portfolio_description = State()
-    add_portfolio_game_type = State()
-    add_portfolio_client = State()
-    add_portfolio_photos = State()
-    edit_setting_select = State()
-    edit_setting_value = State()
-    create_bonus_name = State()
-    create_bonus_description = State()
-    create_bonus_reward = State()
-    create_bonus_conditions = State()
+    # --- Рассылка (оставим, полезная штука) ---
     send_mailing_title = State()
     send_mailing_message = State()
     send_mailing_audience = State()
+
+    # --- Управление заявками (наша новая логика) ---
+    waiting_for_reject_reason = State()  # Ожидание причины отклонения заказа
+    waiting_for_order_price = State()      # Ввод цены проекта
+    waiting_for_search_id = State()       # Поиск заказа по ID
+    waiting_for_stats_admin_id = State()  # Поиск статистики конкретного админа
+    
+    # Состояния для рассылок (на будущее)
+    waiting_for_mailing_text = State()
+
+    # --- Настройки (если планируешь менять цены/тексты через бота) ---
+    edit_setting_select = State()
+    edit_setting_value = State()
+    
+    
 
 class ReceiptForm(StatesGroup):
     enter_amount = State()
@@ -3169,14 +3223,23 @@ async def profile_menu(message: types.Message):
     
     await message.answer(profile_text, reply_markup=get_profile_keyboard())
 
-@dp.message_handler(lambda message: message.text == "🎮 Оформить заявку")
-async def order_start(message: types.Message):
+@dp.message_handler(lambda message: message.text == "🎮 Оформить заявку", state='*')
+async def order_start(message: types.Message, state: FSMContext):
     """Обработчик кнопки Оформить заявку"""
-    order_text = """🎮 ОФОРМЛЕНИЕ ЗАЯВКИ
+    # Удаляем сообщение пользователя "🎮 Оформить заявку" для чистоты
+    try: await message.delete()
+    except: pass
 
-Чтобы начать разработку вашей персональной игры, нам нужна базовая информация. Заполнение анкеты займет 2-3 минуты."""
+    order_text = (
+        "🎮 <b>ОФОРМЛЕНИЕ ЗАЯВКИ</b>\n\n"
+        "Чтобы начать разработку вашей персональной игры, нам нужна базовая информация. "
+        "Заполнение анкеты займет 2-3 минуты."
+    )
     
-    await message.answer(order_text, reply_markup=get_order_start_keyboard())
+    msg = await message.answer(order_text, reply_markup=get_order_start_keyboard(), parse_mode="HTML")
+    
+    # Сохраняем ID этого сообщения
+    await state.update_data(start_info_msg_id=msg.message_id)
 
 
 @dp.message_handler(lambda message: message.text == "🔙 Главное меню", state='*')
@@ -3189,55 +3252,78 @@ async def process_main_menu_text(message: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda message: message.text == "🚀 Начать оформление", state='*')
 async def start_order_creation(message: types.Message, state: FSMContext):
-    """Обработчик кнопки Начать оформление"""
-    await state.finish() 
+    # 1. Сначала удаляем само инфо-сообщение (которое сохранили выше)
+    data = await state.get_data()
+    start_info_id = data.get("start_info_msg_id")
+    if start_info_id:
+        try: await bot.delete_message(message.chat.id, start_info_id)
+        except: pass
+
+    # 2. Удаляем сообщение пользователя "🚀 Начать оформление"
+    try: await message.delete()
+    except: pass
+
+    # 3. Начинаем анкету
     await OrderForm.step1_name.set()
     
+    # Убираем кнопки меню
     temp_msg = await message.answer("Загрузка анкеты...", reply_markup=ReplyKeyboardRemove())
     await temp_msg.delete()
     
-    await message.answer(
+    # Отправляем первый вопрос
+    msg = await message.answer(
         "<b>Начинаем создание вашей игры!</b>\n\n"
         "<b>Шаг 1/12:</b>\n\n"
-        "👤 Как вас зовут?\n"
-        "Укажите имя для обращения в работе",
+        "👤 Как вас зовут?",
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard()
     )
 
-@dp.message_handler(lambda message: message.text == "👑 Админ")
+    # Запоминаем ID первого вопроса для функции удаления на следующем шаге
+    await state.update_data(last_bot_msg_id=msg.message_id)
+
+@dp.message_handler(lambda message: message.text in ["👑 Админ", "Админ-панель"])
 async def admin_panel(message: types.Message):
-    """Обработчик кнопки Админ"""
-    user = await db.get_user(message.from_user.id)
-    if not user or not await db.is_admin(user['id']):
+    # 1. Сначала проверяем, есть ли юзер в базе и какая у него роль
+    user_db = await db.get_user(message.from_user.id)
+    is_owner = message.from_user.id in ADMIN_IDS
+    
+    # Если это не владелец и в базе он не помечен как админ — закрываем доступ
+    if not is_owner and (not user_db or user_db.get('role') != 'admin'):
         return
-    
-    # Получаем реальную статистику
+
+    # 2. Получаем статистику
     stats = await db.get_system_statistics()
-    basic_stats = stats['basic']
-    
-    # Получаем уведомления
+    basic_stats = stats.get('basic', {})
     notifications = await db.get_admin_notifications(5)
-    
-    admin_text = f"""👑 АДМИН ПАНЕЛЬ
 
-Быстрая статистика:
-• 👥 Новые пользователи сегодня: {basic_stats.get('new_users_today', 0)}
-• 👥 Новые пользователи за неделю: {basic_stats.get('new_users_week', 0)}
-• 👥 Новые пользователи за месяц: {basic_stats.get('new_users_month', 0)}
-• 📦 Новые заказы сегодня: {basic_stats.get('new_orders_today', 0)}
-• 📦 Новые заказы за неделю: {basic_stats.get('new_orders_week', 0)}
-• 💰 Выручка сегодня: {basic_stats.get('revenue_today', 0)}₽
-• 💰 Выручка за месяц: {basic_stats.get('revenue_month', 0)}₽
-• 💰 Выручка за все время: {basic_stats.get('orders_revenue', 0)}₽
-• 💬 Консультации сегодня: {basic_stats.get('consultations_today', 0)}
-• 💬 Консультации в ближайшее время: {basic_stats.get('consultations_week', 0)}
+    # 3. Формируем текст в зависимости от прав
+    if is_owner:
+        # Текст для Владельца (с деньгами)
+        admin_text = f"""👑 <b>ПАНЕЛЬ ВЛАДЕЛЬЦА</b>
 
-Требует внимания:
-⚠️ Необработанных заявок: {len(notifications)}"""
-    
-    await message.answer(admin_text, reply_markup=get_admin_keyboard())
+<b>📈 Пользователи:</b>
+• Новые сегодня: <code>{basic_stats.get('new_users_today', 0)}</code>
 
+<b>💰 Финансы (скрыто от админов):</b>
+• Выручка сегодня: <b>{basic_stats.get('revenue_today', 0)}₽</b>
+• Выручка за месяц: <b>{basic_stats.get('revenue_month', 0)}₽</b>
+
+<b>📦 Заказы:</b>
+• Необработанных: <b>{len(notifications)}</b>"""
+    else:
+        # Текст для обычного Админа (без денег)
+        admin_text = f"""🛠 <b>РАБОЧАЯ ПАНЕЛЬ АДМИНА</b>
+
+У вас есть доступ к управлению заказами и пользователями.
+⚠️ Требуют внимания: <b>{len(notifications)}</b> заявок."""
+
+    # 4. Отправляем панель (клавиатура у всех одинаковая, либо можно сделать разную)
+    await message.answer(
+        admin_text, 
+        reply_markup=get_admin_keyboard(), 
+        parse_mode="HTML"
+    )
 
 
 # ==================== ХЕНДЛЕРЫ ДЛЯ АДМИНА ====================
@@ -3349,188 +3435,355 @@ async def cmd_remove_admin(message: types.Message):
         await message.answer("❌ Ошибка: пользователь не найден в базе данных.")
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith(('order_appr_', 'order_rejc_')))
-async def handle_admin_order_choice(callback: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data.startswith(('order_appr_', 'order_rejc_')), state='*')
+async def handle_admin_order_choice(callback: types.CallbackQuery, state: FSMContext):
     import json
     import re
     
     data = callback.data.split('_')
-    action = data[1]  
+    action = data[1]  # appr (принять) или rejc (отклонить)
     client_id = int(data[2])
     admin_user = callback.from_user
     
-    # 1. Извлекаем номер заказа
+    # 1. Вытаскиваем номер заказа из текста сообщения (ищем №ABC12345)
     order_number_match = re.search(r'№([A-Z0-9]+)', callback.message.text)
     order_key = order_number_match.group(1) if order_number_match else f"msg_{callback.message.message_id}"
 
     async with db.pool.acquire() as conn:
-        # 2. Проверка: не занят ли заказ
+        # 2. ПРОВЕРКА: Не занят ли заказ другим админом?
+        # Проверяем по логам или напрямую в таблице orders
         check = await conn.fetchrow("""
             SELECT u.username, u.full_name 
-            FROM activity_log al
-            JOIN users u ON al.user_id = u.id
-            WHERE al.action_type IN ('ORDER_APPR', 'ORDER_REJC')
-            AND al.details->>'order_key' = $1
-            LIMIT 1
+            FROM orders o
+            JOIN users u ON o.manager_id = u.id
+            WHERE o.order_number = $1 AND o.manager_id IS NOT NULL
         """, order_key)
 
         if check:
             winner = check['username'] or check['full_name']
-            await callback.answer(f"⚠️ Опоздали! Эту заявку уже забрал @{winner}", show_alert=True)
-            
-            status_label = "ПРИНЯТА" # Упростим, раз уже в базе есть запись
-            new_text = (
-                f"{callback.message.text}\n\n"
-                f"<b>────────────────────</b>\n"
-                f"<b>Статус:</b> {status_label}\n"
-                f"<b>Ответственный:</b> @{winner}"
-            )
-            try:
-                await callback.message.edit_text(new_text, parse_mode="HTML")
-            except:
-                await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.answer(f"⚠️ Опоздали! Эту заявку уже обрабатывает @{winner}", show_alert=True)
             return
 
-        # 3. Регистрация успеха в базе
+        # Получаем внутренний ID админа в нашей системе
+        adm_row = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", admin_user.id)
+        if not adm_row:
+            return await callback.answer("Ошибка: вы не зарегистрированы как персонал.", show_alert=True)
+
+        # --- КЕЙС 1: ОТКЛОНЕНИЕ (rejc) ---
+        if action == "rejc":
+            # Бронируем статус "в процессе отклонения", чтобы никто не перехватил
+            details = json.dumps({"order_key": order_key, "client_id": client_id})
+            await conn.execute("""
+                INSERT INTO activity_log (user_id, action_type, details)
+                VALUES ($1, 'ORDER_REJC_PROCESS', $2)
+            """, adm_row['id'], details)
+
+            await AdminStates.waiting_for_reject_reason.set()
+            await state.update_data(rejc_client_id=client_id, rejc_order_key=order_key, rejc_message_text=callback.message.text)
+            
+            await bot.send_message(admin_user.id, f"📝 <b>Заказ №{order_key}</b>\nВведите причину отказа для клиента:", parse_mode="HTML")
+            await callback.answer()
+            return 
+
+        # --- КЕЙС 2: ОДОБРЕНИЕ (appr) ---
+        admin_mention = f"@{admin_user.username}" if admin_user.username else admin_user.full_name
+        
+        # Обновляем заказ: назначаем менеджера, ставим статус "Обсуждение"
+        await conn.execute("""
+            UPDATE orders 
+            SET manager_id = $1, 
+                status = 'discussion', 
+                current_stage = 1, 
+                started_at = CURRENT_TIMESTAMP 
+            WHERE order_number = $2
+        """, adm_row['id'], order_key)
+
+        # Логируем успешное принятие
+        details = json.dumps({"client_tg_id": str(client_id), "order_key": order_key, "admin_name": admin_mention})
+        await conn.execute("INSERT INTO activity_log (user_id, action_type, details) VALUES ($1, 'ORDER_APPR', $2)", 
+                           adm_row['id'], details)
+
+        # Уведомляем клиента
+        try:
+            await bot.send_message(
+                client_id, 
+                f"🌟 <b>Ваша заявка одобрена!</b>\n\nМенеджер {admin_mention} изучает вашу анкету и скоро напишет вам в личные сообщения для обсуждения деталей и стоимости.",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление клиенту: {e}")
+
+    # --- ФИНАЛ: МАССОВОЕ ОБНОВЛЕНИЕ СООБЩЕНИЙ У ВСЕХ АДМИНОВ ---
+    async with db.pool.acquire() as conn:
+        # Находим все копии этого сообщения в админ-каналах/чатах
+        rows = await conn.fetch("SELECT admin_tg_id, message_id FROM order_messages WHERE order_key = $1", order_key)
+    
+    # Текст, который увидят все админы после принятия
+    update_text = (
+        f"{callback.message.text}\n\n"
+        f"<b>────────────────────</b>\n"
+        f"<b>СТАТУС:</b> ОБСУЖДЕНИЕ В ЛС\n"
+        f"<b>ОТВЕТСТВЕННЫЙ:</b> {admin_mention}"
+    )
+
+    # Клавиатура С КНОПКОЙ СВЯЗИ (только для того, кто принял)
+    winner_kb = types.InlineKeyboardMarkup()
+    winner_kb.add(types.InlineKeyboardButton("💬 Написать клиенту", url=f"tg://user?id={client_id}"))
+
+    for row in rows:
+        try:
+            # Если это тот админ, который принял — оставляем кнопку связи
+            # Остальным — просто текст без кнопок
+            current_kb = winner_kb if row['admin_tg_id'] == admin_user.id else None
+                
+            await bot.edit_message_text(
+                chat_id=row['admin_tg_id'],
+                message_id=row['message_id'],
+                text=update_text,
+                parse_mode="HTML",
+                reply_markup=current_kb
+            )
+        except: 
+            continue
+
+    # Удаляем записи из временной таблицы рассылки, так как заявка обработана
+    async with db.pool.acquire() as conn:
+        await conn.execute("DELETE FROM order_messages WHERE order_key = $1", order_key)
+
+    await callback.answer("Вы успешно приняли заказ!")
+    await state.finish()
+
+
+@dp.message_handler(state=AdminStates.waiting_for_reject_reason)
+async def process_admin_rejection_reason(message: types.Message, state: FSMContext):
+    import json
+    reason_text = message.text
+    admin_data = await state.get_data()
+    
+    client_id = admin_data['rejc_client_id']
+    order_key = admin_data['rejc_order_key']
+    original_text = admin_data['rejc_message_text']
+    admin_user = message.from_user
+    admin_mention = f"@{admin_user.username}" if admin_user.username else admin_user.full_name
+
+    async with db.pool.acquire() as conn:
+        # 1. УДАЛЯЕМ временную бронь и ПИШЕМ финальный отказ
+        await conn.execute("DELETE FROM activity_log WHERE details->>'order_key' = $1 AND action_type = 'ORDER_REJC_PROCESS'", order_key)
+        
         adm_row = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", admin_user.id)
         if adm_row:
             details = json.dumps({
                 "client_tg_id": str(client_id),
                 "order_key": order_key,
-                "admin_name": admin_user.username
+                "admin_name": admin_mention,
+                "reason": reason_text
             })
-            await conn.execute("""
-                INSERT INTO activity_log (user_id, action_type, details)
-                VALUES ($1, $2, $3)
-            """, adm_row['id'], f"ORDER_{action.upper()}", details)
+            await conn.execute("INSERT INTO activity_log (user_id, action_type, details) VALUES ($1, 'ORDER_REJC', $2)", adm_row['id'], details)
 
-    # 4. Уведомление клиента
-    status_str = "принята" if action == "appr" else "отклонена"
-    admin_mention = f"@{admin_user.username}" if admin_user.username else admin_user.full_name
-    
-    try:
-        res_msg = f"🌟 Ваша заявка одобрена Господином {admin_mention}!" if action == "appr" else f"❌ Отклонено Господином {admin_mention}."
-        await bot.send_message(client_id, res_msg, parse_mode="HTML")
-    except:
-        pass
+        # 2. Уведомляем клиента
+        try:
+            res_msg = f"❌ <b>Ваша заявка отклонена</b>\n\n<b>Причина:</b> {reason_text}"
+            await bot.send_message(client_id, res_msg, parse_mode="HTML")
+        except: pass
 
-    # 5. Обновление сообщения для того, кто УСПЕЛ
-    # Добавим инлайн-кнопку для быстрой связи с клиентом
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("💬 Написать клиенту", url=f"tg://user?id={client_id}"))
+        # 3. Обновляем сообщения у всех админов
+        rows = await conn.fetch("SELECT admin_tg_id, message_id FROM order_messages WHERE order_key = $1", order_key)
 
-    final_text = (
-        f"{callback.message.text}\n\n"
+    update_text = (
+        f"{original_text}\n\n"
         f"<b>────────────────────</b>\n"
-        f"<b>Статус:</b> {status_str.upper()}\n"
+        f"<b>Статус:</b> ОТКЛОНЕНА\n"
+        f"<b>Причина:</b> {reason_text}\n"
         f"<b>Ответственный:</b> {admin_mention}"
     )
+
+    for row in rows:
+        try:
+            await bot.edit_message_text(
+                chat_id=row['admin_tg_id'],
+                message_id=row['message_id'],
+                text=update_text,
+                parse_mode="HTML",
+                reply_markup=None
+            )
+        except: continue
+
+    # 4. Чистим таблицы и стейт
+    async with db.pool.acquire() as conn:
+        await conn.execute("DELETE FROM order_messages WHERE order_key = $1", order_key)
+
+    await message.answer("✅ Отклонено, уведомление отправлено.")
+    await state.finish()
+
+
+@dp.message_handler(state=AdminStates.waiting_for_order_price)
+async def process_order_price_input(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("⚠️ Пожалуйста, введите только число.")
+
+    price = int(message.text)
+    data = await state.get_data()
+    order_key = data.get('current_order_key')
+    client_id = data.get('current_client_id')
     
-    await callback.message.edit_text(final_text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer(f"Вы успешно взяли заказ {order_key}!")
+    async with db.pool.acquire() as conn:
+        # Сохраняем цену в базу
+        await conn.execute("UPDATE orders SET price = $1 WHERE order_number = $2", price, order_key)
+
+    # Уведомляем клиента
+    admin_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+    try:
+        await bot.send_message(client_id, f"🌟 Ваша заявка одобрена!\nОтветственный менеджер: {admin_name}\n\nС вами свяжутся в ближайшее время.")
+    except: pass
+
+    await message.answer(f"✅ Цена {price}₽ установлена. Заказ №{order_key} теперь в списке ваших активных заказов.", 
+                         reply_markup=get_admin_keyboard(message.from_user.id)) # Наша функция меню
+    await state.finish()
 
 # ==================== ОБРАБОТЧИКИ АНКЕТЫ (12 ШАГОВ) ====================
 
 @dp.message_handler(state=OrderForm.step1_name)
 async def process_step1_name(message: types.Message, state: FSMContext):
-    """Шаг 1: Имя"""
     if len(message.text) < 2:
-        return await message.answer("⚠ Пожалуйста, введите корректное имя (хотя бы 2 символа)")
+        error_msg = await message.answer("⚠ Имя слишком короткое! Введите хотя бы 2 символа.")
+        
+        data = await state.get_data()
+        error_ids = data.get("error_msg_ids", [])
+        error_ids.append(error_msg.message_id) 
+        error_ids.append(message.message_id)   
+        
+        await state.update_data(error_msg_ids=error_ids)
+        return 
 
-    async with state.proxy() as data:
-        data['name'] = message.text
-        user = await db.get_user(message.from_user.id)
-        data['user_id'] = user['id']
+    data = await state.get_data()
+    
+    last_bot_msg = data.get("last_bot_msg_id")
+    if last_bot_msg:
+        try: await bot.delete_message(message.chat.id, last_bot_msg)
+        except: pass
+
+    error_ids = data.get("error_msg_ids", [])
+    for m_id in error_ids:
+        try: await bot.delete_message(message.chat.id, m_id)
+        except: pass
+    
+    try: await message.delete()
+    except: pass
+
+    await state.update_data(error_msg_ids=[])
+
+    async with state.proxy() as data_proxy:
+        data_proxy['name'] = message.text
     
     await OrderForm.next()
-    await message.answer(
-        "<b>Шаг 2/12</b>\n\n📞 <b>Ваш контактный телефон для связи?</b>\n"
-        "\nВведите в формате: <code>+7XXXXXXXXXX</code>\n", 
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
-    )
+    new_msg = await message.answer("<b>Шаг 2:\n\n📞 Введите ваш телефон:</b>\n\nВведите в формате <code>7XXXXXXXXXX</code> или <code>8XXXXXXXXXX</code>")
+    await state.update_data(last_bot_msg_id=new_msg.message_id)
 
 @dp.message_handler(state=OrderForm.step2_phone)
 async def process_step2_phone(message: types.Message, state: FSMContext):
-    """Шаг 2: Телефон (Универсальная валидация: мобильные + городские)"""
+    """Шаг 2: Телефон"""
+    data = await state.get_data()
     raw_phone = "".join(filter(str.isdigit, message.text)) 
     
-    if len(raw_phone) != 11:
-        return await message.answer(
-            "⚠ <b>Ошибка в длине номера!</b>\n\n"
-            "Номер должен содержать 11 цифр\n"
-            "Пример: <code>+74951234567</code> или <code>+79001234567</code>",
-            parse_mode="HTML", reply_markup=get_cancel_keyboard()
+    if len(raw_phone) != 11 or len(set(raw_phone)) <= 3 or raw_phone[1] not in ['3', '4', '8', '9']:
+        new_err = await message.answer(
+            "⚠ <b>Ошибка в номере!</b> Введите корректный телефон.\n"
+            "Пример: <code>+79001234567</code>",
+            parse_mode="HTML"
         )
 
-    if len(set(raw_phone)) <= 3:
-        return await message.answer(
-            "⚠ <b>Похоже на некорректный номер!</b>\n"
-            "Пожалуйста, введите настоящий номер телефона",
-            parse_mode="HTML", reply_markup=get_cancel_keyboard()
-        )
+        bad_ids = data.get("error_msg_ids", [])
+        bad_ids.extend([message.message_id, new_err.message_id])
+        await state.update_data(error_msg_ids=bad_ids)
+        return 
 
-    if raw_phone[1] not in ['3', '4', '8', '9']:
-        return await message.answer(
-            "⚠ <b>Некорректный код номера!</b>\n"
-            "Номер должен начинаться с +7, а далее код на 3, 4, 8 или 9\n"
-            "Пожалуйста, проверьте ввод",
-            parse_mode="HTML", reply_markup=get_cancel_keyboard()
-        )
+    last_bot_msg = data.get("last_bot_msg_id")
+    if last_bot_msg:
+        try: await bot.delete_message(message.chat.id, last_bot_msg)
+        except: pass
 
-    formatted_phone = "+7" + raw_phone[1:]
+    error_ids = data.get("error_msg_ids", [])
+    for m_id in error_ids:
+        try: await bot.delete_message(message.chat.id, m_id)
+        except: pass
+    
+    try: await message.delete()
+    except: pass
 
-    async with state.proxy() as data:
-        data['phone'] = formatted_phone
+    await state.update_data(error_msg_ids=[], phone="+7" + raw_phone[1:])
     
     await OrderForm.next()
-    await message.answer(
+    new_msg = await message.answer(
         "<b>Шаг 3/12</b>\n\n🎮 <b>Какое будет название у игры?</b>\n",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
+        parse_mode="HTML", reply_markup=get_cancel_keyboard()
     )
+    await state.update_data(last_bot_msg_id=new_msg.message_id)
 
 @dp.message_handler(state=OrderForm.step3_name_game)
 async def process_step3_name_game(message: types.Message, state: FSMContext):
     """Шаг 3: Имя игры"""
+    data = await state.get_data()
     game_name = message.text.strip() if message.text else ""
-    if not game_name or len(game_name) < 2:
-        return await message.answer("❌ <b>Введите название игры (мин. 2 символа)</b>", parse_mode="HTML")
-    
-    async with state.proxy() as data:
-        data['game_name_input'] = game_name 
 
-    # ВАЖНО: Ведем на step3_date (как у тебя назван хендлер ниже)
+    if not game_name or len(game_name) < 2:
+        new_err = await message.answer("❌ <b>Введите название игры (мин. 2 символа)</b>", parse_mode="HTML")
+        bad_ids = data.get("error_msg_ids", [])
+        bad_ids.extend([message.message_id, new_err.message_id])
+        await state.update_data(error_msg_ids=bad_ids)
+        return
+
+    all_to_delete = data.get("error_msg_ids", [])
+    if data.get("last_bot_msg_id"): 
+        all_to_delete.append(data.get("last_bot_msg_id"))
+    all_to_delete.append(message.message_id)
+
+    for m_id in all_to_delete:
+        try: await bot.delete_message(message.chat.id, m_id)
+        except: pass
+
+    await state.update_data(error_msg_ids=[], game_name_input=game_name) 
     await OrderForm.step4_date.set()
-    await message.answer(
-        "<b>Шаг 4/12</b>\n\n📅 <b>Для какого события или даты создаётся игра?</b>\n"
-        "\nНапример: «Юбилей 15.08.2024»", 
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
+    new_msg = await message.answer(
+        "<b>Шаг 4/12</b>\n\n📅 <b>Для какого события или даты создаётся игра?</b>\n", 
+        parse_mode="HTML", reply_markup=get_cancel_keyboard()
     )
+    await state.update_data(last_bot_msg_id=new_msg.message_id)
 
 @dp.message_handler(state=OrderForm.step4_date)
 async def process_step4_date(message: types.Message, state: FSMContext):
-    """Шаг 4: Дата события (с валидацией)"""
+    """Шаг 4: Дата события"""
+    try: await message.delete()
+    except: pass
+
+    data = await state.get_data()
+    last_msg_id = data.get("last_bot_msg_id")
     text = message.text.strip()
 
     if len(text) < 5:
-        return await message.answer(
-            "⚠ <b>Слишком короткое описание!</b>\n\n"
-            "Пожалуйста, напишите подробнее, например: <i>«Свадьба 20 сентября»</i> или <i>«Корпоратив в декабре»</i>",
-            parse_mode="HTML",
-            reply_markup=get_cancel_keyboard()
+        if last_msg_id:
+            try: await bot.delete_message(message.chat.id, last_msg_id)
+            except: pass
+        new_msg = await message.answer(
+            "⚠ <b>Слишком короткое описание!</b> Напишите подробнее.",
+            parse_mode="HTML", reply_markup=get_cancel_keyboard()
         )
+        await state.update_data(last_bot_msg_id=new_msg.message_id)
+        return
     
+    if last_msg_id:
+        try: await bot.delete_message(message.chat.id, last_msg_id)
+        except: pass
+
     async with state.proxy() as data:
         data['occasion'] = text
     
     await OrderForm.next()
-    await message.answer(
+    new_msg = await message.answer(
         "<b>Шаг 5/12</b>\n\n🎁 <b>Для кого предназначена игра?</b>\n"
         "\n(Выберите вариант или введите свой)", 
         reply_markup=get_target_audience_keyboard()
     )
+    await state.update_data(last_bot_msg_id=new_msg.message_id)
 
 @dp.callback_query_handler(lambda c: c.data.startswith('target_'), state=OrderForm.step5_target)
 async def process_step5_target(callback_query: types.CallbackQuery, state: FSMContext):
@@ -3651,13 +3904,19 @@ async def process_step8_emotions(callback_query: types.CallbackQuery, state: FSM
 @dp.message_handler(state=OrderForm.step9_basis)
 async def process_step9_basis(message: types.Message, state: FSMContext):
     """Шаг 9: Основа игры"""
+    await delete_prev_messages(message, state) # ЧИСТИМ
+
     async with state.proxy() as data:
         data['game_basis'] = message.text
     
     await OrderForm.next()
-    await message.answer("""<b>Шаг 10/12 \n\n🌟 Как вы о нас узнали?</b>""", reply_markup=get_source_keyboard())
+    new_msg = await message.answer(
+        "<b>Шаг 10/12 \n\n🌟 Как вы о нас узнали?</b>", 
+        parse_mode="HTML",
+        reply_markup=get_source_keyboard()
+    )
+    await state.update_data(last_bot_msg_id=new_msg.message_id) # ЗАПОМИНАЕМ
 
-# Шаг 9 - источник (inline кнопки)
 @dp.callback_query_handler(lambda c: c.data.startswith('source_'), state=OrderForm.step10_source)
 async def process_step10_source(callback_query: types.CallbackQuery, state: FSMContext):
     """Шаг 10: Источник"""
@@ -3707,30 +3966,51 @@ async def process_step11_frequency(callback_query: types.CallbackQuery, state: F
 # Шаг 11 - описание (ФИНАЛЬНЫЙ ШАГ)
 @dp.message_handler(state=OrderForm.step12_description)
 async def process_step12_description(message: types.Message, state: FSMContext):
-    if len(message.text) < 10:
-        return await message.answer("⚠ Описание слишком короткое. Напишите подробнее.")
+    """Шаг 12: Финальное описание и превью"""
+    text = message.text.strip() if message.text else ""
+    data = await state.get_data()
 
-    async with state.proxy() as data:
-        data['description'] = message.text
-        game_title = data.get('game_name_input', 'Без названия')
+    # 1. ВАЛИДАЦИЯ (Если текст слишком короткий)
+    if len(text) < 10:
+        new_err = await message.answer(
+            "⚠ <b>Описание слишком короткое!</b>\n"
+            "Напишите подробнее (минимум 10 символов), чтобы мы лучше поняли вашу задумку.",
+            parse_mode="HTML"
+        )
         
-        # Превращаем список эмоций в строку через запятую
+        # Сохраняем ID сообщения юзера и ID ошибки, чтобы удалить их ПОТОМ
+        bad_ids = data.get("error_msg_ids", [])
+        bad_ids.extend([message.message_id, new_err.message_id])
+        await state.update_data(error_msg_ids=bad_ids)
+        return  # Выходим и ждем нового ввода, ничего не удаляя
+
+    # 2. ЕСЛИ ВСЁ ОК — ЧИСТИМ ВЕСЬ «МУСОР»
+    # Вызываем нашу функцию, которая удалит старый вопрос (Шаг 11), 
+    # все накопленные ошибки и текущее (верное) сообщение юзера.
+    await delete_prev_messages(message, state)
+
+    # 3. ФОРМИРУЕМ ПРЕВЬЮ
+    async with state.proxy() as data:
+        data['description'] = text
+        game_title = data.get('game_name_input', 'Без названия')
         emotions_str = ", ".join(data.get('emotions', [])) if data.get('emotions') else "Не выбраны"
 
         preview_text = (
-            "<b>🔍 Проверьте вашу заявку:</b>\n\n"
+            "<b>🔍 Проверьте вашу заявку:</b>\n"
+            "<b>────────────────────</b>\n"
             f"👤 <b>Имя:</b> {data.get('name')}\n"
             f"📱 <b>Телефон:</b> {data.get('phone')}\n"
-            f"🎮 <b>Название игры:</b> {game_title}\n"
+            f"🎮 <b>Игра:</b> {game_title}\n"
             f"📅 <b>Повод:</b> {data.get('occasion')}\n"
             f"👥 <b>Аудитория:</b> {data.get('target_audience')}\n"
             f"💰 <b>Бюджет:</b> {data.get('budget')}\n"
             f"🔢 <b>Игроков:</b> {data.get('players_count')}\n"
             f"❤️ <b>Эмоции:</b> {emotions_str}\n"
-            f"🎯 <b>Основа (механика):</b> {data.get('game_basis')}\n"
-            f"🕕 <b>Опыт в играх:</b> {data.get('play_frequency')}\n"
+            f"🎯 <b>Основа:</b> {data.get('game_basis')}\n"
+            f"🕕 <b>Опыт:</b> {data.get('play_frequency')}\n"
             f"🌟 <b>Источник:</b> {data.get('source')}\n"
-            f"📝 <b>Описание:</b> {data.get('description')}\n\n"
+            f"📝 <b>Описание:</b> {data.get('description')}\n"
+            "<b>────────────────────</b>\n"
             "<b>Все верно? Отправляем заявку на одобрение?</b>"
         )
 
@@ -3738,24 +4018,38 @@ async def process_step12_description(message: types.Message, state: FSMContext):
     kb.add(types.KeyboardButton("✅ Да, отправить"), types.KeyboardButton("❌ Заполнить заново"))
 
     await OrderForm.confirm_order.set()
-    await message.answer(preview_text, parse_mode="HTML", reply_markup=kb)
+    
+    # Отправляем превью и запоминаем его ID
+    final_msg = await message.answer(preview_text, parse_mode="HTML", reply_markup=kb)
+    await state.update_data(last_bot_msg_id=final_msg.message_id)
 
 @dp.message_handler(state=OrderForm.confirm_order)
 async def process_confirm(message: types.Message, state: FSMContext):
+    # 1. Если нажал "Заполнить заново"
     if message.text == "❌ Заполнить заново":
+        await delete_prev_messages(message, state) # Чистим превью
+        
         await state.finish() 
         await OrderForm.step1_name.set() 
-        return await message.answer(
+        
+        msg = await message.answer(
             "<b>Хорошо, начнем сначала</b>\n\n<b>Шаг 1/12:</b>\n\n👤 Как вас зовут?",
             parse_mode="HTML",
-            reply_markup=types.ReplyKeyboardRemove()
+            reply_markup=get_cancel_keyboard()
         )
+        await state.update_data(last_bot_msg_id=msg.message_id)
+        return
 
+    # 2. Если нажал "✅ Да, отправить"
     if message.text == "✅ Да, отправить":
+        # СНАЧАЛА ЧИСТИМ ЧАТ (удаляем превью и кнопку юзера)
+        await delete_prev_messages(message, state)
+        
         user = await db.get_user(message.from_user.id)
         tg_username = f"@{message.from_user.username}" if message.from_user.username else "Скрыт"
 
         async with state.proxy() as data:
+            # Формируем полный список данных для БД
             order_data = {
                 'phone': data.get('phone'),
                 'game_name': data.get('game_name_input'), 
@@ -3772,32 +4066,45 @@ async def process_confirm(message: types.Message, state: FSMContext):
             }
             
             try:
-                # 1. Сохраняем в базу
+                # Сохраняем в базу
                 order = await db.create_order(user['id'], order_data)
                 
-                # 2. Очищаем состояние пользователя
+                # Подготавливаем эмоции для текста
+                emotions_str = ", ".join(data.get('emotions', [])) if data.get('emotions') else "Не выбраны"
+
+                # ФОРМИРУЕМ ПОЛНУЮ ЗАЯВКУ ДЛЯ АДМИНОВ (Все 12 шагов)
+                full_order_details = (
+                    f"🔔 <b>НОВАЯ ЗАЯВКА №{order['order_number']}</b>\n"
+                    f"<b>────────────────────</b>\n"
+                    f"👤 <b>Имя:</b> {data.get('name')}\n"
+                    f"📱 <b>Телефон:</b> {data.get('phone')}\n"
+                    f"🌐 <b>Telegram:</b> {tg_username}\n"
+                    f"<b>────────────────────</b>\n"
+                    f"🎮 <b>Игра:</b> {data.get('game_name_input')}\n"
+                    f"📅 <b>Повод:</b> {data.get('occasion')}\n"
+                    f"👥 <b>Аудитория:</b> {data.get('target_audience')}\n"
+                    f"💰 <b>Бюджет:</b> {data.get('budget')}\n"
+                    f"🔢 <b>Игроков:</b> {data.get('players_count')}\n"
+                    f"❤️ <b>Эмоции:</b> {emotions_str}\n"
+                    f"🎯 <b>Основа:</b> {data.get('game_basis')}\n"
+                    f"🕕 <b>Опыт:</b> {data.get('play_frequency')}\n"
+                    f"🌟 <b>Источник:</b> {data.get('source')}\n"
+                    f"📝 <b>Описание:</b>\n{data.get('description')}\n"
+                    f"<b>────────────────────</b>"
+                )
+                
+                # Уведомляем админов
+                await notify_admins_new_order(message.from_user, full_order_details)
+
+                # Закрываем стейт ПОСЛЕ формирования всех данных
                 await state.finish()
                 
-                # 3. Выводим главное меню пользователю
                 is_admin = await db.is_admin(message.from_user.id)
                 await message.answer(
-                    "🚀 <b>Заявка отправлена!</b>\nМенеджер свяжется с вами в ближайшее время.", 
+                    "🚀 <b>Заявка успешно отправлена!</b>\nМенеджер свяжется с вами в ближайшее время.", 
                     parse_mode="HTML", 
                     reply_markup=get_main_menu_keyboard(is_admin)
                 )
-                
-                # 4. ВЫЗЫВАЕМ ФУНКЦИЮ УВЕДОМЛЕНИЯ АДМИНОВ
-                # Мы передаем сформированный текст в нашу функцию
-                full_order_details = (
-                    f"🔔 <b>НОВАЯ ЗАЯВКА №{order['order_number']}</b>\n"
-                    f"────────────────────\n"
-                    f"📱 <b>Телефон:</b> {order_data['phone']}\n"
-                    f"🎮 <b>Игра:</b> {order_data['game_name']}\n"
-                    f"💰 <b>Бюджет:</b> {order_data['budget']}\n"
-                    f"📝 <b>Описание:</b> {order_data['description']}"
-                )
-                
-                await notify_admins_new_order(message.from_user, full_order_details)
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке заказа: {e}")
