@@ -59,6 +59,33 @@ bot = Bot(token=TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
+
+# ==================== ДОП ФУНКЦИИ  ====================
+
+async def notify_admins_new_order(user: types.User, order_content: str):
+    admin_ids = await db.get_admin_recipients()
+    username = f"@{user.username}" if user.username else "Скрыт"
+    
+    # Текст сообщения (используем то, что пришло в order_content + данные юзера)
+    text = (
+        f"{order_content}\n"
+        f"👤 <b>Клиент:</b> {user.full_name} ({username})\n"
+        f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+        "────────────────────\n"
+        "Выберите действие:"
+    )
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Принять", callback_data=f"order_appr_{user.id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"order_rejc_{user.id}")
+    )
+
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"Ошибка рассылки админу {admin_id}: {e}")
 # ==================== БАЗА ДАННЫХ ====================
 class Database:
     def __init__(self):
@@ -731,6 +758,20 @@ class Database:
                 print(f"Ошибка логирования: {e}")
 
             return True, target_tg_id
+        
+
+    async def get_admin_recipients(self):
+        async with self.pool.acquire() as conn:
+            # Собираем TG ID всех админов из базы
+            rows = await conn.fetch("""
+                SELECT u.telegram_id FROM admins a 
+                JOIN users u ON a.user_id = u.id
+            """)
+            admins = [row['telegram_id'] for row in rows]
+            
+            # Добавляем тебя (владельца) из конфига (ADMIN_IDS)
+            all_recipients = list(set(admins + list(ADMIN_IDS)))
+            return all_recipients
     
     async def create_user(self, telegram_id: int, username: str, full_name: str, referrer_code: str = None) -> Dict:
         """Создать нового пользователя"""
@@ -3307,6 +3348,87 @@ async def cmd_remove_admin(message: types.Message):
     else:
         await message.answer("❌ Ошибка: пользователь не найден в базе данных.")
 
+
+@dp.callback_query_handler(lambda c: c.data.startswith(('order_appr_', 'order_rejc_')))
+async def handle_admin_order_choice(callback: types.CallbackQuery):
+    import json
+    import re
+    
+    data = callback.data.split('_')
+    action = data[1]  
+    client_id = int(data[2])
+    admin_user = callback.from_user
+    
+    # 1. Извлекаем номер заказа
+    order_number_match = re.search(r'№([A-Z0-9]+)', callback.message.text)
+    order_key = order_number_match.group(1) if order_number_match else f"msg_{callback.message.message_id}"
+
+    async with db.pool.acquire() as conn:
+        # 2. Проверка: не занят ли заказ
+        check = await conn.fetchrow("""
+            SELECT u.username, u.full_name 
+            FROM activity_log al
+            JOIN users u ON al.user_id = u.id
+            WHERE al.action_type IN ('ORDER_APPR', 'ORDER_REJC')
+            AND al.details->>'order_key' = $1
+            LIMIT 1
+        """, order_key)
+
+        if check:
+            winner = check['username'] or check['full_name']
+            await callback.answer(f"⚠️ Опоздали! Эту заявку уже забрал @{winner}", show_alert=True)
+            
+            status_label = "ПРИНЯТА" # Упростим, раз уже в базе есть запись
+            new_text = (
+                f"{callback.message.text}\n\n"
+                f"<b>────────────────────</b>\n"
+                f"<b>Статус:</b> {status_label}\n"
+                f"<b>Ответственный:</b> @{winner}"
+            )
+            try:
+                await callback.message.edit_text(new_text, parse_mode="HTML")
+            except:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return
+
+        # 3. Регистрация успеха в базе
+        adm_row = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", admin_user.id)
+        if adm_row:
+            details = json.dumps({
+                "client_tg_id": str(client_id),
+                "order_key": order_key,
+                "admin_name": admin_user.username
+            })
+            await conn.execute("""
+                INSERT INTO activity_log (user_id, action_type, details)
+                VALUES ($1, $2, $3)
+            """, adm_row['id'], f"ORDER_{action.upper()}", details)
+
+    # 4. Уведомление клиента
+    status_str = "принята" if action == "appr" else "отклонена"
+    admin_mention = f"@{admin_user.username}" if admin_user.username else admin_user.full_name
+    
+    try:
+        res_msg = f"🌟 Ваша заявка одобрена Господином {admin_mention}!" if action == "appr" else f"❌ Отклонено Господином {admin_mention}."
+        await bot.send_message(client_id, res_msg, parse_mode="HTML")
+    except:
+        pass
+
+    # 5. Обновление сообщения для того, кто УСПЕЛ
+    # Добавим инлайн-кнопку для быстрой связи с клиентом
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💬 Написать клиенту", url=f"tg://user?id={client_id}"))
+
+    final_text = (
+        f"{callback.message.text}\n\n"
+        f"<b>────────────────────</b>\n"
+        f"<b>Статус:</b> {status_str.upper()}\n"
+        f"<b>Ответственный:</b> {admin_mention}"
+    )
+    
+    await callback.message.edit_text(final_text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer(f"Вы успешно взяли заказ {order_key}!")
+
 # ==================== ОБРАБОТЧИКИ АНКЕТЫ (12 ШАГОВ) ====================
 
 @dp.message_handler(state=OrderForm.step1_name)
@@ -3621,11 +3743,8 @@ async def process_step12_description(message: types.Message, state: FSMContext):
 @dp.message_handler(state=OrderForm.confirm_order)
 async def process_confirm(message: types.Message, state: FSMContext):
     if message.text == "❌ Заполнить заново":
-        # Очищаем данные старой анкеты, чтобы начать с чистого листа
         await state.finish() 
-        # Снова включаем первое состояние
         await OrderForm.step1_name.set() 
-        
         return await message.answer(
             "<b>Хорошо, начнем сначала</b>\n\n<b>Шаг 1/12:</b>\n\n👤 Как вас зовут?",
             parse_mode="HTML",
@@ -3653,30 +3772,36 @@ async def process_confirm(message: types.Message, state: FSMContext):
             }
             
             try:
+                # 1. Сохраняем в базу
                 order = await db.create_order(user['id'], order_data)
                 
+                # 2. Очищаем состояние пользователя
                 await state.finish()
-                is_admin = await db.is_admin(user['id'])
-                await message.answer("🚀 <b>Заявка отправлена!</b> Менеджер свяжется с вами.", 
-                                   parse_mode="HTML", reply_markup=get_main_menu_keyboard(is_admin))
                 
-                admin_text = (
-                    f"🔔 <b>НОВАЯ ЗАЯВКА НА ОДОБРЕНИЕ!</b>\n\n"
-                    f"👤 Отправитель: {user['full_name']}\n"
-                    f"📱 Телефон: {order_data['phone']}\n"
-                    f"🆔 Номер заказа: <code>{order['order_number']}</code>\n"
-                    f"📝 Название: {order_data['game_name']}"
+                # 3. Выводим главное меню пользователю
+                is_admin = await db.is_admin(message.from_user.id)
+                await message.answer(
+                    "🚀 <b>Заявка отправлена!</b>\nМенеджер свяжется с вами в ближайшее время.", 
+                    parse_mode="HTML", 
+                    reply_markup=get_main_menu_keyboard(is_admin)
                 )
                 
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, admin_text, parse_mode="HTML")
-                    except:
-                        continue
+                # 4. ВЫЗЫВАЕМ ФУНКЦИЮ УВЕДОМЛЕНИЯ АДМИНОВ
+                # Мы передаем сформированный текст в нашу функцию
+                full_order_details = (
+                    f"🔔 <b>НОВАЯ ЗАЯВКА №{order['order_number']}</b>\n"
+                    f"────────────────────\n"
+                    f"📱 <b>Телефон:</b> {order_data['phone']}\n"
+                    f"🎮 <b>Игра:</b> {order_data['game_name']}\n"
+                    f"💰 <b>Бюджет:</b> {order_data['budget']}\n"
+                    f"📝 <b>Описание:</b> {order_data['description']}"
+                )
+                
+                await notify_admins_new_order(message.from_user, full_order_details)
 
             except Exception as e:
-                logger.error(f"Ошибка: {e}")
-                await message.answer("❌ Ошибка при отправке.")
+                logger.error(f"Ошибка при обработке заказа: {e}")
+                await message.answer("❌ Произошла ошибка при отправке заявки.")
 
 # ==================== ОБРАБОТЧИКИ INLINE КНОПОК ====================
 
