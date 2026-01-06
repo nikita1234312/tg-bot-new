@@ -6,6 +6,9 @@ import uuid
 import csv
 import io
 import re
+import asyncio
+import sys
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Set
 from enum import Enum
@@ -23,6 +26,11 @@ from aiogram.types import InputFile, ContentType, InputMediaPhoto
 from aiogram.utils.exceptions import BotBlocked, ChatNotFound
 from aiogram.utils.markdown import escape_md
 import aioschedule
+
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 # --- Код для поддержки работоспособности на Render ---
 async def handle(request):
